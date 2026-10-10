@@ -5,7 +5,7 @@
 [![PennyLane 0.33+](https://img.shields.io/badge/PennyLane-0.33+-yellow.svg)](https://pennylane.ai/)
 [![MedMNIST v2](https://img.shields.io/badge/Dataset-MedMNIST%20v2-green.svg)](https://medmnist.com/)
 [![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-FF4B4B.svg)](https://streamlit.io/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+
 
 An institutional-grade, research-validated computational framework integrating frozen and fine-tuned Foundation Vision Backbones (**BiomedCLIP ViT-B/16**) with **N-Qubit Variational Quantum Circuits (VQC / HQCNN)** for multimodal early medical disease detection.
 
