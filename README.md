@@ -1,4 +1,4 @@
-# Hybrid Classical-Quantum Neural Network (CNN-VQC & HQCNN) Framework for Early Disease Prediction
+# 🧬 Hybrid Classical-Quantum Neural Network (CNN-VQC & HQCNN) Framework for Early Disease Prediction
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
@@ -7,16 +7,16 @@
 [![Streamlit](https://img.shields.io/badge/Dashboard-Streamlit-FF4B4B.svg)](https://streamlit.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
-An institutional-grade, research-validated computational framework integrating frozen and fine-tuned Foundation Vision Backbones (**BiomedCLIP ViT-B/16**) with **$N$-Qubit Variational Quantum Circuits (VQC / HQCNN)** for multimodal early medical disease detection. 
+An institutional-grade, research-validated computational framework integrating frozen and fine-tuned Foundation Vision Backbones (**BiomedCLIP ViT-B/16**) with **N-Qubit Variational Quantum Circuits (VQC / HQCNN)** for multimodal early medical disease detection.
 
-Designed for high-stakes clinical diagnostic workflows across the **MedMNIST v2** benchmark suite (e.g., PneumoniaMNIST, DermaMNIST, RetinaMNIST, BreastMNIST, OrganAMNIST) and real-world medical image archives (COVID-19 Radiography, OASIS-1 Brain MRI), this repository features rigorous anti-shortcut learning modules, geometric Riemannian spherical feature projection, quantum neural architecture search (QNAS), dual-basis Pauli observable readout, strictly positive temperature calibration, and an interactive Streamlit clinical dashboard with Grad-CAM and quantum saliency interpretability.
+Designed for high-stakes clinical diagnostic workflows across the **MedMNIST v2** benchmark suite (PneumoniaMNIST, DermaMNIST, RetinaMNIST, BreastMNIST, OrganAMNIST, PathMNIST) and real-world medical image archives (COVID-19 Radiography, OASIS-1 Brain MRI), this repository features rigorous anti-shortcut learning modules, geometric Riemannian spherical feature projection, quantum neural architecture search (QNAS), dual-basis Pauli observable readout, strictly positive temperature calibration, and an interactive Streamlit clinical dashboard with Grad-CAM and quantum saliency interpretability.
 
 ---
 
-## Table of Contents
+## 📑 Table of Contents
 
-1. [Executive Summary & Clinical Rationale](#1-executive-summary--clinical-rationale)
-2. [Key Architectural Innovations & Mathematical Foundations](#2-key-architectural-innovations--mathematical-foundations)
+1. [🏥 Executive Summary & Clinical Rationale](#1--executive-summary--clinical-rationale)
+2. [🧠 Key Architectural Innovations & Formal Foundations](#2--key-architectural-innovations--formal-foundations)
    - [2.1 Foundation Vision Backbone (BiomedCLIP ViT-B/16)](#21-foundation-vision-backbone-biomedclip-vit-b16)
    - [2.2 Classical-to-Quantum Adapter (CQ-Adapter) & Riemannian S² Head](#22-classical-to-quantum-adapter-cq-adapter--riemannian-s-head)
    - [2.3 Variational Quantum Circuit (VQC) Ansätze](#23-variational-quantum-circuit-vqc-ansätze)
@@ -26,20 +26,20 @@ Designed for high-stakes clinical diagnostic workflows across the **MedMNIST v2*
    - [2.7 Class Imbalance Mitigation: CB-LDAM-DRW & Asymmetric Loss](#27-class-imbalance-mitigation-cb-ldam-drw--asymmetric-loss)
    - [2.8 Clinical Calibration & Specificity-Constrained Decision Thresholds](#28-clinical-calibration--specificity-constrained-decision-thresholds)
    - [2.9 Quantum Continual Learning: QFIM & QEWC](#29-quantum-continual-learning-qfim--qewc)
-3. [Repository Directory & File Architecture](#3-repository-directory--file-architecture)
-4. [Installation & Environment Setup](#4-installation--environment-setup)
-   - [4.1 Prerequisites](#41-prerequisites)
+3. [📂 Repository Directory & File Architecture](#3--repository-directory--file-architecture)
+4. [⚙️ Installation & Environment Setup](#4--installation--environment-setup)
+   - [4.1 Prerequisites & System Requirements](#41-prerequisites--system-requirements)
    - [4.2 Virtual Environment Initialization](#42-virtual-environment-initialization)
    - [4.3 Dependency Installation](#43-dependency-installation)
    - [4.4 Multithreading & Memory Safety Variables](#44-multithreading--memory-safety-variables)
-5. [End-to-End Execution Guide](#5-end-to-end-execution-guide)
+5. [🚀 End-to-End Execution Guide](#5--end-to-end-execution-guide)
    - [5.1 Training Engine (`engine.py`)](#51-training-engine-enginepy)
      - [Standard Hybrid VQC Training](#standard-hybrid-vqc-training)
-     - [HQCNN Dual-Basis DermaMNIST Pipeline](#hqcnn-dual-basis-dermamnist-pipeline)
+     - [HQCNN Dual-Basis DermaMNIST Flagship Pipeline](#hqcnn-dual-basis-dermamnist-flagship-pipeline)
      - [Stratified K-Fold Cross-Validation](#stratified-k-fold-cross-validation)
      - [Quantum Continual Learning (QEWC)](#quantum-continual-learning-qewc)
      - [Quantum Architecture Search (QNAS) & Progressive Depth Growth](#quantum-architecture-search-qnas--progressive-depth-growth)
-     - [Evaluation-Only Mode](#evaluation-only-mode)
+     - [Evaluation-Only Mode & Threshold Recalibration](#evaluation-only-mode--threshold-recalibration)
      - [Comprehensive CLI Flag Reference for `engine.py`](#comprehensive-cli-flag-reference-for-enginepy)
    - [5.2 Interactive Clinical Streamlit Dashboard (`app.py`)](#52-interactive-clinical-streamlit-dashboard-apppy)
    - [5.3 Independent Evaluation & Benchmarking Suite (`testing.py`)](#53-independent-evaluation--benchmarking-suite-testingpy)
@@ -47,52 +47,55 @@ Designed for high-stakes clinical diagnostic workflows across the **MedMNIST v2*
    - [5.5 BiomedCLIP ViT Fine-Tuning (`finetuning.py`)](#55-biomedclip-vit-fine-tuning-finetuningpy)
    - [5.6 Classical-to-Quantum Adapter Pre-training (`adapter.py`)](#56-classical-to-quantum-adapter-pre-training-adapterpy)
    - [5.7 Diagnostic Pipeline Verification (`test_pipeline.py`)](#57-diagnostic-pipeline-verification-test_pipelinepy)
-6. [Supported Datasets & Clinical Modalities](#6-supported-datasets--clinical-modalities)
-7. [Comprehensive Diagnostic Plotting Suite (39 Plots)](#7-comprehensive-diagnostic-plotting-suite-39-plots)
-8. [Troubleshooting & Common Engineering Pitfalls](#8-troubleshooting--common-engineering-pitfalls)
+6. [📊 Supported Datasets & Clinical Modalities](#6--supported-datasets--clinical-modalities)
+7. [📈 Comprehensive Diagnostic Plotting Suite (39 Plots)](#7--comprehensive-diagnostic-plotting-suite-39-plots)
+8. [🛠️ Troubleshooting & Common Engineering Pitfalls](#8--troubleshooting--common-engineering-pitfalls)
+9. [📜 Citation & Academic Reference](#9--citation--academic-reference)
 
 ---
 
-## 1. Executive Summary & Clinical Rationale
+## 1. 🏥 Executive Summary & Clinical Rationale
 
-Deep learning models deployed in clinical imaging are prone to shortcut learning (relying on peripheral scanner markers, border illumination artifacts, or background noise) and overconfident miscalibrations on underrepresented pathological classes. 
+Deep learning models deployed in clinical imaging are notoriously prone to two fundamental failure modes:
+1. **Shortcut Learning:** Exploiting peripheral non-pathological artifacts such as scanner brand borders, hospital orientation markers, text watermarks, or illumination gradients rather than true biological lesion morphology.
+2. **Pathological Overconfidence:** Generating uncalibrated, extreme probability scores on rare clinical classes due to severe population prevalence skew (e.g., malignant melanoma vs. benign nevi).
 
-This repository implements a **Hybrid Classical-Quantum Architecture (HQCNN / CNN-VQC)** designed to overcome these fundamental failure modes:
-1. **Geometric Quantum State Encoding:** High-dimensional vision representations from BiomedCLIP ViT are compressed and projected onto a compact Riemannian Bloch sphere $\mathcal{S}^2$, preventing the network from overfitting to non-biological high-frequency noise.
-2. **Dual-Basis Readout Observables:** Measuring both longitudinal computational basis $\langle Z_i \rangle$ (optical density/absorption) and transverse superposition basis $\langle X_i \rangle$ (structural boundary asymmetry) grants the quantum layer high expressive sensitivity to micro-architectural lesion features.
-3. **Provable Anti-Shortcut Guarantees:** Through morphological foreground masking, GridMask, border cropping, feature-decorrelation loss ($\mathcal{L}_{\text{decorr}}$), and saliency-concentration penalties ($\mathcal{L}_{\text{saliency}}$), the model is penalized whenever predictions correlate with peripheral background pixels.
-4. **Safety-Constrained Clinical Decisions:** Multi-class probability distributions undergo strictly positive Platt temperature calibration ($T(\tau) = 0.1 + \text{softplus}(\tau)$) and cost-sensitive threshold shifting enforced with a strict $\text{Specificity} \ge 0.9000$ floor.
+This repository implements a **Hybrid Classical-Quantum Convolutional Architecture (HQCNN / CNN-VQC)** engineered to address these challenges:
+- **Geometric Quantum State Compression:** High-dimensional vision representations from BiomedCLIP ViT are compressed and mapped onto single-qubit Riemannian Bloch spheres S², filtering high-frequency scanner noise.
+- **Dual-Basis Quantum Readout:** Measuring both the longitudinal computational basis `<Z_i>` (optical pigment absorption density) and transverse superposition basis `<X_i>` (micro-structural lesion margin asymmetry) allows the quantum circuit to extract non-linear spatial correlations.
+- **Provable Anti-Shortcut Guarantees:** Through morphological foreground masking, GridMask, border cropping, feature decorrelation loss (`L_decorr`), and saliency concentration penalties (`L_saliency`), model reliance on peripheral background pixels is penalized.
+- **Safety-Constrained Decisions:** Predictive distributions undergo strictly positive Platt temperature calibration (`T(tau) = 0.1 + softplus(tau)`) and cost-sensitive threshold tuning bounded by a strict `Specificity >= 0.9000` clinical floor.
 
 ---
 
-## 2. Key Architectural Innovations & Mathematical Foundations
+## 2. 🧠 Key Architectural Innovations & Formal Foundations
 
 ```
-MedMNIST Medical Input (28x28 to 224x224 RGB/Grayscale)
+MedMNIST Medical Input (28x28 to 224x224 RGB / Grayscale)
          │
          ▼  [preprocessing.py / dataset.py]
  Modality-Adaptive Preprocessing & Anti-Shortcut Suite
-  ├── Foreground Mask Extraction: M_fg ∈ {0, 1}^{H×W}
+  ├── Foreground Mask Extraction: M_fg in {0, 1}^(H x W)
   ├── RandomBorderCrop, GridMask, RandomHistogramEqualization
-  └── MultiViewBatchCollator (Flattened 4D Batch)
+  └── MultiViewBatchCollator (Flattened 4D Batch: (B*V, C, H, W))
          │
          ▼  [model.py / finetuning.py]
  Frozen / Top-2 Unfrozen BiomedCLIP ViT-B/16 Backbone
-  └── L2-Normalized CLS Embedding Vector: f ∈ ℝ⁵¹²
+  └── L2-Normalized CLS Embedding Vector: f in R^512
          │
          ▼  [adapter.py]
  Classical-to-Quantum Adapter (CQ-Adapter)
-  ├── LoRA-Q Factorization: W_eff = W₀ + (scale/rank) · (B @ A)
+  ├── LoRA-Q Factorization: W_eff = W_0 + (scale / rank) * (B @ A)
   ├── Cayley Map Orthogonal Parameterization
   └── Riemannian S² Spherical Head:
-        θ_i = σ(v_i) · π  ∈ [0, π]
-        φ_i = tanh(v_{i+n}) · π ∈ [-π, π]
-        λ_i = tanh(v_{i+2n}) · π ∈ [-π, π]
+        theta_i = sigmoid(v_i) * pi          in [0, pi]
+        phi_i   = tanh(v_{i+n}) * pi         in [-pi, pi]
+        lambda_i = tanh(v_{i+2n}) * pi       in [-pi, pi]
          │
          ▼  [model.py / ansatz/qaf.py / PennyLane Engine]
- Quantum Hilbert Space Circuit (N=8 Qubits, dim ℋ = 256)
-  ├── Ground State Preparation: |0⟩^⊗N
-  ├── Universal Data Re-Uploading: U3(θ, φ, λ)
+ Quantum Hilbert Space Circuit (N=8 Qubits, dim H = 256)
+  ├── Ground State Preparation: |0>^N
+  ├── Universal Data Re-Uploading: U3(theta, phi, lambda)
   ├── Variational Layer Topologies:
   │     ├── Option A: Hierarchical QAF (Superpositional Entanglement + Toffoli Attention + Fourier CPhase)
   │     ├── Option B: QNAS Evolutionary DAG Supercircuit
@@ -101,126 +104,163 @@ MedMNIST Medical Input (28x28 to 224x224 RGB/Grayscale)
          │
          ▼  [Readout Observables]
  Quantum Measurement Transformation:
-  ├── Dual-Basis HQCNN: [⟨Z_i⟩, ⟨X_i⟩] ∈ [-1, 1]^{2N}  (16 dims for N=8)
-  └── Legacy Pauli:     [⟨Z_i⟩, ⟨Z_i Z_{i+1}⟩, ⟨X_i⟩] ∈ [-1, 1]^{3N-1} (23 dims for N=8)
+  ├── Dual-Basis HQCNN: [<Z_i>, <X_i>] in [-1, 1]^(2N)      (16 dims for N=8)
+  └── Legacy Pauli:     [<Z_i>, <Z_i Z_{i+1}>, <X_i>] in [-1, 1]^(3N-1) (23 dims for N=8)
          │
          ▼  [model.py]
  Symmetric Projection Head:
-  Linear(dim_readout → 32) ──► GELU ──► Dropout(0.2) ──► Linear(32 → C)
+  Linear(dim_readout -> 32) ──► GELU ──► Dropout(0.2) ──► Linear(32 -> C)
          │
          ▼  [losses.py / calibration.py / engine.py]
  Optimization & Clinical Decision Calibration:
   ├── Loss: CB-LDAM-DRW + L_decorr + L_saliency
   ├── Multi-Rate AdamW: lr_backbone=1e-5, lr_adapter=1e-3, lr_quantum=1e-2
-  ├── Strictly Positive Platt Calibration: T(τ) = 0.1 + ln(1 + e^τ)
-  └── Cost-Sensitive Thresholding: Specificity ≥ 0.9000 floor
+  ├── Strictly Positive Platt Calibration: T(tau) = 0.1 + ln(1 + exp(tau))
+  └── Cost-Sensitive Thresholding: Specificity >= 0.9000 floor
 ```
 
 ### 2.1 Foundation Vision Backbone (BiomedCLIP ViT-B/16)
-The vision encoder leverages domain-specific knowledge pretrained on over 15 million biomedical image-text pairs (PubMed Central).
-- Grayscale medical inputs (e.g., Pneumonia chest radiographs) are expanded to 3 channels via channel replication: $x \leftarrow x.\text{repeat}(1, 3, 1, 1)$.
-- Input normalization: $\mu = [0.4814, 0.4578, 0.4082]$, $\sigma = [0.2686, 0.2613, 0.2758]$.
-- Feature extraction yields a 512-dimensional $\ell_2$-normalized class token: $f_{\text{CLS}} \in \mathbb{R}^{512}$.
-- To eliminate data leakage and domain conflict, fine-tuned backbone weights are isolated per dataset under `biomedclip/{dataset}_biomedclip_vit.pt`.
+The vision encoder leverages domain knowledge pretrained on over 15 million biomedical image-text pairs from PubMed Central:
+- Grayscale medical inputs (e.g., pediatric chest radiographs) are expanded to 3 channels: `x = x.repeat(1, 3, 1, 1)`.
+- Input normalization values: `mean = [0.4814, 0.4578, 0.4082]`, `std = [0.2686, 0.2613, 0.2758]`.
+- Feature extraction produces a 512-dimensional L2-normalized class token: `f_CLS in R^512`.
+- Fine-tuned backbone weights are saved per dataset under `biomedclip/{dataset}_biomedclip_vit.pt`.
 
 ### 2.2 Classical-to-Quantum Adapter (CQ-Adapter) & Riemannian S² Head
-To bridge the 512-dimensional classical latent space with the $N$-qubit quantum register (default $N=8$, $\dim \mathcal{H} = 256$), the network implements a constrained linear projection:
-$$\mathbf{v} = \mathbf{W}_{\text{eff}} f_{\text{CLS}} + \mathbf{b} \in \mathbb{R}^{3N}$$
+To bridge the 512-dimensional classical latent space with the N-qubit quantum register (default N=8, Hilbert dimension 256), the network applies a constrained projection:
+```text
+v = W_eff @ f_CLS + b   where v in R^(3N)
+```
 
-Where $\mathbf{W}_{\text{eff}}$ uses **LoRA-Q Factorization**:
-$$\mathbf{W}_{\text{eff}} = \mathbf{W}_0 + \frac{\alpha}{r} (\mathbf{B} \mathbf{A})$$
-Here, $\mathbf{W}_0$ is frozen with orthogonal Cayley initialization, while $\mathbf{A} \in \mathbb{R}^{r \times 512}$ and $\mathbf{B} \in \mathbb{R}^{3N \times r}$ ($r=4$) are trained.
+Where `W_eff` utilizes **LoRA-Q Factorization**:
+```text
+W_eff = W_0 + (alpha / rank) * (B @ A)
+```
+- `W_0` is frozen with orthogonal Cayley initialization.
+- `A in R^(rank x 512)` and `B in R^(3N x rank)` (rank = 4, alpha = 1.0) are trainable.
 
-The resulting vector $\mathbf{v}$ is mapped onto individual single-qubit Bloch spheres via the **Riemannian $\mathcal{S}^2$ Head**:
-$$\theta_i = \sigma(v_i) \cdot \pi \in [0, \pi]$$
-$$\phi_i = \tanh(v_{i+N}) \cdot \pi \in [-\pi, \pi]$$
-$$\lambda_i = \tanh(v_{i+2N}) \cdot \pi \in [-\pi, \pi]$$
+The resulting vector `v` is mapped onto single-qubit Bloch spheres via the **Riemannian S² Head**:
+```text
+theta_i  = sigmoid(v_i) * pi          in [0, pi]
+phi_i    = tanh(v_{i+N}) * pi         in [-pi, pi]
+lambda_i = tanh(v_{i+2N}) * pi        in [-pi, pi]
+```
 
-Each qubit receives a full polar parameterization defining the state $|\psi_i\rangle = \cos(\theta_i/2)|0\rangle + e^{i\phi_i}\sin(\theta_i/2)|1\rangle$. In clinical-hardening mode (`--clinical_hard`), the polar angle is bounded to $[-\pi/2, \pi/2]$ to prevent phase-wrapping boundary singularities.
+Each qubit receives parameters defining the pure state:
+```text
+|psi_i> = cos(theta_i / 2)|0> + exp(i * phi_i) * sin(theta_i / 2)|1>
+```
+
+In clinical-hardening mode (`--clinical_hard`), the polar angle is restricted to `[-pi/2, pi/2]` to eliminate phase-wrapping decision boundaries.
 
 ### 2.3 Variational Quantum Circuit (VQC) Ansätze
-The engine supports three variational quantum circuit configurations:
+The engine supports three variational circuit architectures:
 
 1. **Hierarchical Quantum Attention-Fourier (QAF) Circuit (`--use_qaf_attention`):**
-   - **Universal Data Re-Uploading:** $U_3(\theta_i, \phi_i, \lambda_i)$ parameterized rotation gates inserted before *every* variational layer.
+   - **Universal Data Re-Uploading:** `U3(theta_i, phi_i, lambda_i)` single-qubit rotations applied before every layer.
    - **Superpositional Entanglement:** Nearest-neighbor cyclic CNOT ring creating entanglement across adjacent wires.
    - **Local 3-Qubit Toffoli Attention:** Parameterized non-linear multi-qubit interaction modulating attention between adjacent qubit triplets.
-   - **Global Dyadic Fourier Phase Modulation:** Controlled-phase ($CR_Z$) rotations with dyadic scaling phases $\Delta \phi_{j,k} = \frac{2\pi}{2^{|j-k|}}$ capturing multi-scale non-local feature interactions.
-   - **Variational Rotation Blocks:** Independent $R_{\text{ot}}(\omega_1, \omega_2, \omega_3)$ gates applied per qubit wire.
+   - **Global Dyadic Fourier Phase Modulation:** Controlled-phase (`CRZ`) rotations with dyadic scaling phases `Delta_phi_{j,k} = 2*pi / (2^|j-k|)` capturing multi-scale non-local feature interactions.
+   - **Variational Rotation Blocks:** Independent `Rot(w_1, w_2, w_3)` gates applied per wire.
 
 2. **Evolutionary Quantum Architecture Search (QNAS DAG, `--use_qnas`):**
    - Represents the ansatz as a directed acyclic graph (DAG) genome.
-   - Candidate gate vocabulary: $\{R_X, R_Y, R_Z, U_3, \text{CNOT}, \text{CZ}, \mathbb{I}\}$.
-   - Evaluates architectures on a Pareto frontier balancing validation accuracy, Meyer-Wallach entanglement capability, and a penalization term for CNOT gate count to minimize physical decoherence.
+   - Gate vocabulary: `Rx, Ry, Rz, U3, CNOT, CZ, Identity`.
+   - Evaluates architectures on a Pareto frontier balancing validation accuracy, Meyer-Wallach entanglement capacity, and a penalty for CNOT count to reduce circuit noise.
 
 3. **Strongly Entangling Layers (Default Fallback):**
-   - Periodic parameterized single-qubit rotations followed by entangling CNOT gates with range offsets $r = 1, \dots, N-1$.
+   - Periodic parameterized single-qubit rotations followed by entangling CNOT gates with range offsets `r = 1, ..., N-1`.
 
 ### 2.4 Quantum Readout Paradigms: Dual-Basis (HQCNN) vs. Legacy Pauli
 - **HQCNN Dual-Basis Readout (`--dual_basis_readout`):**
-  Measures both computational basis and transversal superposition observables:
-  $$\mathbf{y}_{\text{readout}} = \left[ \langle Z_0 \rangle, \dots, \langle Z_{N-1} \rangle, \langle X_0 \rangle, \dots, \langle X_{N-1} \rangle \right]^T \in [-1, 1]^{2N}$$
-  For $N=8$, this outputs a 16-dimensional vector. Clinically, $\langle Z_i \rangle$ measures diagonal state absorption (e.g., optical pigment concentration), while $\langle X_i \rangle = 2\operatorname{Re}(\rho_{01})$ captures off-diagonal coherence (structural lesion margin asymmetry).
+  Measures both longitudinal computational and transverse superposition observables:
+  ```text
+  y_readout = [<Z_0>, ..., <Z_{N-1}>, <X_0>, ..., <X_{N-1}>]^T  in [-1, 1]^(2N)
+  ```
+  For N=8, this outputs 16 dimensions. `<Z_i>` captures diagonal optical absorption (pigment density), while `<X_i> = 2 * Re(rho_01)` measures off-diagonal coherence (lesion margin asymmetry).
 - **Legacy Pauli Readout (Default):**
-  $$\mathbf{y}_{\text{readout}} = \left[ \{\langle Z_i \rangle\}_{i=0}^{N-1}, \{\langle Z_i Z_{i+1} \rangle\}_{i=0}^{N-2}, \{\langle X_i \rangle\}_{i=0}^{N-1} \right]^T \in [-1, 1]^{3N-1}$$
-  Outputs 23 measurement features for $N=8$.
+  ```text
+  y_readout = [<Z_i> for i in 0..N-1, <Z_i Z_{i+1}> for i in 0..N-2, <X_i> for i in 0..N-1]^T  in [-1, 1]^(3N-1)
+  ```
+  Outputs 23 measurement features for N=8.
 
 ### 2.5 Parameter-Matched Classical Baseline
-To prove whether quantum advantage exists, `model.py` provides `ClassicalBaseline`:
-$$\mathbf{z}_{\text{baseline}} = \mathbf{W}_2 \cdot \text{Dropout}\left(\text{GELU}\left(\mathbf{W}_1 f_{\text{CLS}}\right)\right)$$
-The baseline replaces the VQC with an identically dimensioned classical MLP having matched parameters, identical learning rates, and identical loss formulations.
+To provide a fair comparison with the quantum model, `model.py` implements `ClassicalBaseline`:
+```text
+z_baseline = W_2 @ Dropout(GELU(W_1 @ f_CLS))
+```
+This baseline matches the parameter count, learning rate, and loss formulation of the hybrid model without using a VQC.
 
 ### 2.6 Anti-Shortcut Learning & Modality Adaptation Suite
-Medical models often overfit to scanner-specific borders, text watermarks, or peripheral illumination. The anti-shortcut suite in `preprocessing.py` eliminates these confounders:
-- **Otsu / Adaptive Foreground Mask Extraction:** Generates binary region-of-interest masks $M_{\text{fg}} \in \{0, 1\}^{H \times W}$.
-- **GridMask & RandomBorderCrop:** Zeroes peripheral margins and applies structured dropout to eliminate edge artifacts.
-- **Feature Decorrelation Loss ($\mathcal{L}_{\text{decorr}}$):**
-  $$\mathcal{L}_{\text{decorr}} = \frac{1}{K} \sum_{k=1}^K \left| \text{Corr}(f_{\text{CLS}}, \mathbf{h}_k) \right|$$
-  Penalizes linear correlation between backbone embeddings and low-level heuristic features $\mathbf{h}_k$ (image border intensity, global mean luminance, high-frequency boundary energy).
-- **Saliency Concentration Loss ($\mathcal{L}_{\text{saliency}}$):**
-  $$\mathcal{L}_{\text{saliency}} = 1.0 - \frac{\sum_{(u, v) \in \text{ROI}} \mathcal{A}(u, v)}{\sum_{u, v} \mathcal{A}(u, v)}$$
-  Forces Grad-CAM attention maps $\mathcal{A}$ to lie within the clinical lesion boundary.
-- **Shortcut Verification Score ($S$):**
-  $$S = \frac{\mathbb{E}_{x \sim \mathcal{D}} \left[ \max_c P(y=c \mid x \cdot (1 - M_{\text{fg}})) \right]}{\mathbb{E}_{x \sim \mathcal{D}} \left[ \max_c P(y=c \mid x) \right]}$$
-  A model with $S \to 0$ makes decisions purely based on pathological anatomy; $S > 0.5$ warns of shortcut reliance.
+Medical models often overfit to scanner-specific borders, text watermarks, or peripheral illumination. The anti-shortcut suite in `preprocessing.py` mitigates these confounders:
+- **Foreground Mask Extraction:** Computes binary region-of-interest masks `M_fg in {0, 1}^(H x W)` using adaptive thresholding.
+- **GridMask & RandomBorderCrop:** Crops peripheral margins and introduces dropout grids to disrupt edge artifacts.
+- **Feature Decorrelation Loss (`L_decorr`):**
+  ```text
+  L_decorr = (1 / K) * sum_{k=1}^K |Corr(f_CLS, h_k)|
+  ```
+  Penalizes linear correlation between backbone embeddings and low-level heuristic features `h_k` (border intensity, mean luminance, edge energy).
+- **Saliency Concentration Loss (`L_saliency`):**
+  ```text
+  L_saliency = 1.0 - (sum_{(u,v) in ROI} A(u, v)) / (sum_{u,v} A(u, v))
+  ```
+  Forces Grad-CAM activation mass `A` to concentrate inside the pathological lesion boundary.
+- **Shortcut Verification Score (`S`):**
+  ```text
+  S = E[ max_c P(y=c | x * (1 - M_fg)) ] / E[ max_c P(y=c | x) ]
+  ```
+  An ideal model exhibits `S -> 0` (no confidence from background alone). Values of `S > 0.5` flag reliance on background shortcuts.
 
 ### 2.7 Class Imbalance Mitigation: CB-LDAM-DRW & Asymmetric Loss
 For severe clinical imbalance (e.g., DermaMNIST melanoma vs. benign nevi):
-- **Class-Balanced LDAM Loss (CB-LDAM):** Enforces margins scaled inversely by class population:
-  $$\Delta_c = \frac{C_{\text{margin}}}{N_c^{1/4}}$$
-  $$\mathcal{L}_{\text{LDAM}}(z, y) = -\log \frac{e^{z_y - \Delta_y}}{e^{z_y - \Delta_y} + \sum_{j \neq y} e^{z_j}}$$
-- **Deferred Re-Weighting (DRW):** Operates with uniform class weights for the first $E_{\text{DRW}}$ epochs, then ramps class-balanced effective number weights via a cosine schedule:
-  $$w_c \propto \frac{1 - \beta}{1 - \beta^{N_c}}, \quad \beta = 0.9999$$
+- **Class-Balanced LDAM Loss (CB-LDAM):** Enforces margins inversely proportional to class population:
+  ```text
+  Delta_c = C_margin / (N_c^(1/4))
+  L_LDAM(z, y) = -log( exp(z_y - Delta_y) / (exp(z_y - Delta_y) + sum_{j != y} exp(z_j)) )
+  ```
+- **Deferred Re-Weighting (DRW):** Uses uniform class weights for the first `E_DRW` epochs, then ramps class-balanced effective weights using a cosine schedule:
+  ```text
+  w_c proportional to (1 - beta) / (1 - beta^(N_c)),  where beta = 0.9999
+  ```
 
 ### 2.8 Clinical Calibration & Specificity-Constrained Decision Thresholds
 - **Strictly Positive Platt Scaling (`calibration.py`):**
-  Uncalibrated logits $z$ produce calibrated probabilities $P(y=c \mid z) = \text{softmax}(z / T(\tau))$ using a guaranteed positive temperature:
-  $$T(\tau) = 0.1 + \ln(1 + e^\tau)$$
-  This eliminates catastrophic probability inversion when optimizing over parameter $\tau$.
+  Calculates calibrated probabilities `P(y=c | z) = softmax(z / T(tau))` using a positive temperature:
+  ```text
+  T(tau) = 0.1 + ln(1 + exp(tau))
+  ```
+  This prevents probability inversion during numerical optimization.
 - **Cost-Sensitive Multi-Class Threshold Optimization:**
-  Selects probability thresholds $\mathbf{t}^*$ to minimize expected false-negative penalties while satisfying a regulatory specificity ceiling:
-  $$\mathbf{t}^* = \arg\max_{\mathbf{t}} \text{Sensitivity}(\mathbf{t}) \quad \text{subject to} \quad \text{Specificity}(\mathbf{t}) \ge 0.9000$$
+  Finds decision thresholds `t*` that maximize sensitivity while adhering to a strict specificity floor:
+  ```text
+  t* = argmax_t Sensitivity(t)   subject to   Specificity(t) >= 0.9000
+  ```
 
 ### 2.9 Quantum Continual Learning: QFIM & QEWC
-When fine-tuning sequentially across hospital sites or imaging domains, `continual.py` prevents catastrophic forgetting using **Quantum Elastic Weight Consolidation (QEWC)**:
-$$\mathcal{L}_{\text{total}}(\theta) = \mathcal{L}_{\text{task}}(\theta) + \sum_{k} \frac{\lambda_{\text{EWC}}}{2} F_{k, k} (\theta_k - \theta_k^*)^2$$
-Where $F_{k, k}$ is the diagonal of the **Quantum Fisher Information Matrix (QFIM)** evaluated via parameter-shift rules:
-$$F_{k, k} = 4 \left( \langle \partial_k \psi \mid \partial_k \psi \rangle - \left| \langle \psi \mid \partial_k \psi \rangle \right|^2 \right)$$
+When fine-tuning sequentially across hospital sites or imaging domains, `continual.py` mitigates catastrophic forgetting using **Quantum Elastic Weight Consolidation (QEWC)**:
+```text
+L_total(theta) = L_task(theta) + sum_k (lambda_EWC / 2) * F_{k,k} * (theta_k - theta_k^*)^2
+```
+Where `F_{k,k}` represents the diagonal of the **Quantum Fisher Information Matrix (QFIM)** evaluated via parameter-shift rules:
+```text
+F_{k,k} = 4 * ( <d_k psi | d_k psi> - |<psi | d_k psi>|^2 )
+```
 
 ---
 
-## 3. Repository Directory & File Architecture
+## 3. 📂 Repository Directory & File Architecture
 
 ```
 Early Disease Prediction/
 ├── architecture.md               # Detailed scientific architectural reference
-├── env.sh                        # Shell environment export script for thread capping
+├── env.sh                        # Shell environment script for thread capping
 ├── requirements.txt              # Production dependency specifications
-├── npz_convert.py                # Standalone medical dataset downloader & .npz compiler
+├── npz_convert.py                # Medical dataset downloader & .npz compiler
 ├── testing.py                    # Independent batch model evaluation & benchmark suite
 ├── task.md                       # Task tracker and verification checklist
 ├── problems.md                   # Formal mathematical and scientific audit records
-├── biomedclip/                   # Isolated fine-tuned BiomedCLIP ViT checkpoints
+├── README.md                     # Comprehensive repository documentation
+├── biomedclip/                   # Fine-tuned BiomedCLIP ViT checkpoints
 ├── data/                         # Local MedMNIST and custom .npz dataset storage
 ├── outputs/                      # Generated evaluation outputs and diagnostic plots
 │   └── <dataset_name>/           # Per-dataset metrics, checkpoints, and 39 plots
@@ -249,23 +289,23 @@ Early Disease Prediction/
 
 ---
 
-## 4. Installation & Environment Setup
+## 4. ⚙️ Installation & Environment Setup
 
-### 4.1 Prerequisites
-- **Operating System:** Linux (Ubuntu 20.04/22.04), Windows 10/11, or macOS (Apple Silicon M1/M2/M3 supported).
+### 4.1 Prerequisites & System Requirements
+- **Operating System:** Linux (Ubuntu 20.04/22.04), Windows 10/11 (PowerShell), or macOS (Apple Silicon M-series supported).
 - **Python:** Version 3.10 or 3.11 recommended.
-- **CUDA / Compute Hardware:** NVIDIA GPU with $\ge 8\text{ GB}$ VRAM recommended for hardware acceleration; CPU execution is fully supported via PennyLane's `default.qubit`.
+- **Compute Hardware:** Dedicated NVIDIA GPU with 8 GB or more VRAM recommended; CPU execution is supported via PennyLane's `default.qubit`.
 
 ### 4.2 Virtual Environment Initialization
 
 ```bash
-# Clone or navigate to the repository root
+# Navigate to the repository root
 cd "d:/Code/QuantumML/Early Disease Prediction"
 
 # Create a clean virtual environment
 python -m venv venv
 
-# Activate on Linux/macOS:
+# Activate on Linux / macOS:
 source venv/bin/activate
 
 # Activate on Windows (PowerShell):
@@ -277,20 +317,20 @@ source venv/bin/activate
 
 ### 4.3 Dependency Installation
 
-Install all required dependencies using `requirements.txt`:
+Install production dependencies using `requirements.txt`:
 
 ```bash
 pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
 ```
 
-Verify that the core packages are correctly recognized:
+Verify the environment:
 ```bash
-python -c "import torch, pennylane, streamlit, medmnist, open_clip; print('All core libraries imported successfully!')"
+python -c "import torch, pennylane, streamlit, medmnist, open_clip; print('All core libraries verified!')"
 ```
 
 ### 4.4 Multithreading & Memory Safety Variables
-Under WSL2, Hyper-V, or multi-core workstations, OpenMP and MKL thread oversubscription can exhaust RAM during parallel quantum circuit simulation. Before running large training jobs, cap the worker thread count:
+Under WSL2, Hyper-V, or multi-core workstations, OpenMP and MKL thread oversubscription can cause memory bottlenecks during parallel quantum simulation. Cap thread counts before training:
 
 **Linux / macOS:**
 ```bash
@@ -310,10 +350,10 @@ $env:OPENBLAS_NUM_THREADS="4"
 
 ---
 
-## 5. End-to-End Execution Guide
+## 5. 🚀 End-to-End Execution Guide
 
 ### 5.1 Training Engine (`engine.py`)
-`engine.py` is the central command-line interface orchestrator for model training, architecture search, cross-validation, and metric generation.
+`engine.py` is the primary CLI orchestrator for training, architecture search, cross-validation, and diagnostic evaluation.
 
 #### Standard Hybrid VQC Training
 Train a standard 4-qubit, 3-layer Hybrid CNN-VQC on PneumoniaMNIST:
@@ -321,8 +361,8 @@ Train a standard 4-qubit, 3-layer Hybrid CNN-VQC on PneumoniaMNIST:
 python qml_models/engine.py --dataset pneumoniamnist --epochs 15 --batch_size 32 --n_qubits 4 --n_layers 3 --lr 1e-3
 ```
 
-#### HQCNN Dual-Basis DermaMNIST Pipeline
-Train the flagship 8-qubit HQCNN with Dual-Basis Readout, Hierarchical QAF Attention, CB-LDAM Loss, Anti-Shortcut penalties, and Clinical Hardening:
+#### HQCNN Dual-Basis DermaMNIST Flagship Pipeline
+Train an 8-qubit HQCNN on DermaMNIST with Dual-Basis Readout, QAF Attention, CB-LDAM Loss, Anti-Shortcut penalties, and Clinical Hardening:
 ```bash
 python qml_models/engine.py \
   --dataset dermamnist \
@@ -343,7 +383,7 @@ python qml_models/engine.py \
 ```
 
 #### Stratified K-Fold Cross-Validation
-Perform 5-fold cross-validation with Out-of-Fold (OOF) ensembling and Dirichlet probability calibration:
+Run 5-fold cross-validation with Out-of-Fold (OOF) ensembling and Dirichlet calibration:
 ```bash
 python qml_models/engine.py \
   --dataset pneumoniamnist \
@@ -356,7 +396,7 @@ python qml_models/engine.py \
 ```
 
 #### Quantum Continual Learning (QEWC)
-Train sequentially across multiple datasets while preserving previously acquired representations:
+Train sequentially across multiple datasets while regularizing weights via the Quantum Fisher Information Matrix:
 ```bash
 python qml_models/engine.py \
   --continual \
@@ -368,7 +408,7 @@ python qml_models/engine.py \
 ```
 
 #### Quantum Architecture Search (QNAS) & Progressive Depth Growth
-Search for an optimal quantum ansatz using Pareto evolutionary optimization, then progressively grow depth from 1 to 3 layers:
+Search for an optimal quantum ansatz using Pareto evolutionary optimization, then progressively expand circuit depth:
 ```bash
 python qml_models/engine.py \
   --dataset pneumoniamnist \
@@ -380,8 +420,8 @@ python qml_models/engine.py \
   --n_qubits 4
 ```
 
-#### Evaluation-Only Mode
-Evaluate a previously trained checkpoint and re-calibrate decision thresholds on validation data:
+#### Evaluation-Only Mode & Threshold Recalibration
+Evaluate a trained model checkpoint and optimize decision thresholds on validation data:
 ```bash
 python qml_models/engine.py \
   --dataset pneumoniamnist \
@@ -396,47 +436,47 @@ python qml_models/engine.py \
 
 | CLI Flag | Type | Default | Description |
 |:---|:---:|:---:|:---|
-| `--dataset` | `str` | `pneumoniamnist` | Target dataset name from MedMNIST or converted local archives (`dermamnist`, `retinamnist`, `breastmnist`, `covid`, `oasis`). |
+| `--dataset` | `str` | `pneumoniamnist` | Target dataset: `pneumoniamnist`, `dermamnist`, `retinamnist`, `breastmnist`, `organamnist`, `pathmnist`, `covid`, `oasis`. |
 | `--epochs` | `int` | `15` | Total training epochs. |
 | `--batch_size` | `int` | `32` | Minibatch size for training and validation loaders. |
-| `--lr` | `float` | `1e-3` | Base learning rate for classical projection and classification layers. |
+| `--lr` | `float` | `1e-3` | Base learning rate for projection and classification layers. |
 | `--n_qubits` | `int` | `4` | Number of qubits in quantum register (scalable to 8). |
 | `--n_layers` | `int` | `3` | Number of variational layers in the ansatz circuit. |
-| `--dual_basis_readout` | `flag` | `False` | Enables Dual-Basis Pauli $[\langle Z \rangle, \langle X \rangle]$ readout ($2N$ features) instead of legacy Pauli ($3N-1$ features). |
+| `--dual_basis_readout` | `flag` | `False` | Enables Dual-Basis Pauli `[<Z>, <X>]` readout (2N features) instead of legacy Pauli (3N-1 features). |
 | `--use_qaf_attention` | `flag` | `False` | Enables Hierarchical QAF circuit (Superpositional Entanglement + Toffoli Attention + Fourier CPhase). |
-| `--clinical_hard` | `flag` | `False` | Hardens adapter: constrains polar angles to $[-\pi/2, \pi/2]$ to prevent phase-wrapping decision boundaries. |
+| `--clinical_hard` | `flag` | `False` | Restricts CQ-adapter polar angles to `[-pi/2, pi/2]` to eliminate phase-wrapping boundary artifacts. |
 | `--loss_type` | `str` | `ce` | Primary loss function: `ce` (Cross-Entropy), `focal`, or `ldam` (CB-LDAM-DRW). |
-| `--ldam_max_margin` | `float` | `0.5` | Maximum margin offset $\Delta_{\max}$ for minority classes in CB-LDAM. |
+| `--ldam_max_margin` | `float` | `0.5` | Maximum margin offset for minority classes in CB-LDAM. |
 | `--drw_start_epoch` | `int` | `10` | Epoch at which Deferred Re-Weighting activates in CB-LDAM. |
 | `--lambda_decorr` | `float` | `0.01` | Weight for anti-shortcut feature decorrelation loss penalty. |
 | `--lambda_saliency` | `float` | `0.05` | Weight for anti-shortcut saliency concentration loss penalty. |
 | `--target_specificity`| `float` | `0.9000` | Minimum specificity constraint enforced during threshold search. |
-| `--use_lora` | `flag` | `False` | Applies LoRA-Q factorization ($r=4$) to the classical adapter. |
-| `--use_qnas` | `flag` | `False` | Executes Quantum Neural Architecture Search for ansatz structure. |
+| `--use_lora` | `flag` | `False` | Applies LoRA-Q factorization (rank=4) to the classical adapter. |
+| `--use_qnas` | `flag` | `False` | Executes Quantum Neural Architecture Search for ansatz design. |
 | `--progressive` | `flag` | `False` | Activates progressive layer-wise depth expansion during training. |
 | `--kfold` | `flag` | `False` | Executes Stratified K-Fold Cross-Validation with OOF ensembling. |
 | `--n_folds` | `int` | `5` | Number of cross-validation folds. |
 | `--continual` | `flag` | `False` | Enables continual learning mode using QEWC. |
 | `--lambda_ewc` | `float` | `100.0` | Regularization coefficient for Quantum Elastic Weight Consolidation. |
 | `--amp` / `--no_amp` | `flag` | `True` | Enables/disables Automatic Mixed Precision (AMP) for classical operations. |
-| `--cache_in_vram` | `flag` | `False` | Caches frozen BiomedCLIP embeddings directly in GPU VRAM for maximum throughput. |
-| `--fast_eval` | `flag` | `False` | Bypasses heavy quantum noise simulations and 2D loss landscapes to save 10-15 minutes. |
-| `--skip_plots` | `flag` | `False` | Completely skips generation of diagnostic plots during quick sweeps. |
+| `--cache_in_vram` | `flag` | `False` | Caches frozen BiomedCLIP embeddings directly in GPU VRAM. |
+| `--fast_eval` | `flag` | `False` | Bypasses 2D loss landscapes and heavy quantum noise simulations. |
+| `--skip_plots` | `flag` | `False` | Skips generation of diagnostic plots during quick hyperparameter sweeps. |
 | `--plot_workers` | `int` | `4` | Parallel worker processes used to render diagnostic figures. |
 
 ---
 
 ### 5.2 Interactive Clinical Streamlit Dashboard (`app.py`)
-`app.py` delivers an institutional-grade, clinician-facing visual interface designed for real-time diagnostic evaluation, side-by-side model auditing, and interpretability analysis.
+`app.py` delivers an interactive clinical dashboard for side-by-side model auditing, diagnostic consensus verification, and interpretability analysis.
 
 ```bash
 # Launch the dashboard from the repository root:
 streamlit run qml_models/app.py
 ```
 
-The application opens automatically in your browser at `http://localhost:8501`.
+The application runs locally at `http://localhost:8501`.
 
-```
+```text
 ========================================================================================
                   DUAL CLINICAL DIAGNOSIS & QUANTUM AUDITING DASHBOARD
 ========================================================================================
@@ -444,28 +484,28 @@ The application opens automatically in your browser at `http://localhost:8501`.
   Chest X-Ray /           Diagnosis: PNEUMONIA (94.2%)      Diagnosis: PNEUMONIA (81.6%)
   Dermoscopy              Calibrated Conf: 91.8%            Calibrated Conf: 78.4%
   Slide                   Conformal Set: {Pneumonia}        Conformal Set: {Normal, Pneumonia}
-                          Uncertainty: ±0.038 (Low)         Uncertainty: ±0.092 (Moderate)
+                          Uncertainty: +/- 0.038 (Low)      Uncertainty: +/- 0.092 (Moderate)
 ----------------------------------------------------------------------------------------
  [CONSENSUS ALERT]      STATUS: HIGH CLINICAL CONSENSUS (Models Agree on Primary Pathogen)
 ----------------------------------------------------------------------------------------
  [INTERPRETABILITY]
-  Captum Grad-CAM:        Highlights dense pulmonary consolidation in lower right lobe
+  Captum Grad-CAM:        Highlights dense consolidation in lower right lung field
   Quantum Pauli-Z Saliency: Wires q0 and q3 show >0.85 polarization on lesion boundary
 ========================================================================================
 ```
 
 #### Core Dashboard Capabilities:
-1. **Dual Model Comparison:** Runs the `HybridCNNVQC` model and the parameter-matched `ClassicalBaseline` simultaneously on uploaded patient scans or sample datasets.
-2. **Consensus & Divergence Alerts:** Automatically flags whether both architectures agree. When models diverge, an amber alert prompts the clinician for secondary specialist review.
-3. **Calibrated Probabilities & Conformal Prediction:** Displays strictly positive Platt-calibrated probability distributions alongside 90% and 95% Conformal Prediction sets with bounded error rates.
-4. **Captum Grad-CAM Lesion Localization:** Computes gradient-weighted class activation heatmaps overlaid onto the original medical image to localize biological pathology.
-5. **Live Pauli Observable Saliency:** Generates bar charts showing the expectation values of quantum observables ($\langle Z_i \rangle$, $\langle X_i \rangle$), showing which qubits drove the clinical classification.
-6. **Zero-Latency Offline Mode:** Operates with cached models and offline flags (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), ensuring instant sub-second startup with no network dependencies.
+1. **Dual Model Comparison:** Runs `HybridCNNVQC` and `ClassicalBaseline` simultaneously on uploaded patient scans or benchmark samples.
+2. **Consensus & Divergence Alerts:** Automatically verifies diagnostic agreement. If models diverge, a clinical warning flag prompts manual physician review.
+3. **Calibrated Probabilities & Conformal Sets:** Displays strictly positive Platt-calibrated probabilities alongside 90% and 95% Conformal Prediction sets with bounded coverage errors.
+4. **Captum Grad-CAM Lesion Localization:** Overlays gradient-weighted class activation heatmaps onto original scans to verify anatomical focus.
+5. **Live Pauli Observable Saliency:** Displays horizontal bar charts of quantum expectation values (`<Z_i>`, `<X_i>`), showing qubit polarizations during classification.
+6. **Zero-Latency Offline Mode:** Operates with cached models and offline flags (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`), ensuring fast local startup.
 
 ---
 
 ### 5.3 Independent Evaluation & Benchmarking Suite (`testing.py`)
-To benchmark trained checkpoints, compute statistical hypothesis tests, or regenerate diagnostic figures without running a training loop:
+To benchmark saved model checkpoints, compute hypothesis tests, or regenerate diagnostic figures without retraining:
 
 ```bash
 # Evaluate on a single dataset with 100 test samples:
@@ -474,14 +514,14 @@ python testing.py --dataset pneumoniamnist --num_samples 100
 # Evaluate using Out-of-Fold (OOF) K-Fold checkpoints:
 python testing.py --dataset pneumoniamnist --kfold
 
-# Run across all available trained datasets:
+# Run benchmarks across all available trained datasets:
 python testing.py --dataset all
 ```
 
 ---
 
 ### 5.4 Dataset Ingestion & NPZ Preprocessing (`npz_convert.py`)
-To incorporate real-world external medical archives (COVID-19 Radiography or OASIS-1 Brain MRI), `npz_convert.py` downloads images via KaggleHub, extracts binary diagnostic cohorts, applies stratified splits (70% train / 10% validation / 20% test), and compiles them into MedMNIST-compatible `.npz` archives.
+To incorporate external medical archives (COVID-19 Radiography or OASIS-1 Brain MRI), `npz_convert.py` downloads cohorts via KaggleHub, resizes images, applies stratified splits (70% train / 10% validation / 20% test), and compiles MedMNIST-compatible `.npz` files.
 
 ```bash
 # Download and compile COVID-19 Radiography (224x224):
@@ -494,7 +534,7 @@ python npz_convert.py --dataset oasis --data_dir data --output data/oasis_224.np
 ---
 
 ### 5.5 BiomedCLIP ViT Fine-Tuning (`finetuning.py`)
-Before training the quantum layer, you can fine-tune the upper transformer layers of the BiomedCLIP backbone for a specific dataset:
+Before training the quantum circuit, fine-tune the upper transformer layers of BiomedCLIP for a specific clinical domain:
 
 ```bash
 python qml_models/finetuning.py \
@@ -505,12 +545,12 @@ python qml_models/finetuning.py \
   --save_dir biomedclip
 ```
 
-This saves an isolated checkpoint at `biomedclip/dermamnist_biomedclip_vit.pt`.
+Checkpoints are stored at `biomedclip/{dataset}_biomedclip_vit.pt`.
 
 ---
 
 ### 5.6 Classical-to-Quantum Adapter Pre-training (`adapter.py`)
-Pre-train the Classical-to-Quantum adapter to map classical features onto a uniform, isotropic distribution across the Bloch sphere prior to VQC optimization:
+Pre-train the Classical-to-Quantum adapter to map classical features uniformly across the Bloch sphere prior to VQC training:
 
 ```bash
 python qml_models/adapter.py \
@@ -523,7 +563,7 @@ python qml_models/adapter.py \
 ---
 
 ### 5.7 Diagnostic Pipeline Verification (`test_pipeline.py`)
-Run the test pipeline to verify that all modules (model instantiations, adapters, quantum nodes, loss functions, and dataset loaders) execute without runtime errors:
+Verify end-to-end pipeline integrity (model construction, quantum nodes, loss functions, and data loaders) with smoke tests:
 
 ```bash
 python qml_models/test_pipeline.py
@@ -531,24 +571,24 @@ python qml_models/test_pipeline.py
 
 ---
 
-## 6. Supported Datasets & Clinical Modalities
+## 6. 📊 Supported Datasets & Clinical Modalities
 
-| Dataset Identifier | Clinical Modality | Diagnostic Target | Classes | Input Dimensions | Default Split (Train/Val/Test) |
+| Dataset Identifier | Clinical Modality | Diagnostic Target | Classes | Input Dimensions | Default Split (Train / Val / Test) |
 |:---|:---|:---|:---:|:---:|:---:|
-| `pneumoniamnist` | Pediatric Chest X-Ray | Normal vs. Pneumonia | 2 | 28×28 / 224×224 | 4,708 / 524 / 624 |
-| `dermamnist` | Dermatoscopy | Skin Lesions (Melanoma, Basal Cell, Nevi, etc.) | 7 | 28×28 / 224×224 | 7,007 / 1,003 / 2,005 |
-| `retinamnist` | Fundus Photography | Diabetic Retinopathy Grading | 5 | 28×28 / 224×224 | 1,080 / 120 / 400 |
-| `breastmnist` | Breast Ultrasound | Benign vs. Malignant Masses | 2 | 28×28 / 224×224 | 546 / 78 / 156 |
-| `organamnist` | Abdominal Computed Tomography (CT) | Multi-Organ Anatomical Classification | 11 | 28×28 / 224×224 | 34,581 / 6,491 / 17,778 |
-| `pathmnist` | Colorectal Histopathology | Tissue Morphology (Adenoma, Mucosa, Stroma) | 9 | 28×28 / 224×224 | 89,996 / 10,004 / 7,180 |
-| `covid` | Adult Chest X-Ray | Healthy vs. COVID-19 Infiltration | 2 | 224×224 | 10,616 / 1,516 / 3,033 |
-| `oasis` | Cross-Sectional Brain MRI | Cognitive Health vs. Dementia | 2 | 224×224 | 291 / 42 / 83 |
+| `pneumoniamnist` | Pediatric Chest X-Ray | Normal vs. Pneumonia | 2 | 28x28 / 224x224 | 4,708 / 524 / 624 |
+| `dermamnist` | Dermatoscopy | Skin Lesions (Melanoma, Basal Cell, Nevi, etc.) | 7 | 28x28 / 224x224 | 7,007 / 1,003 / 2,005 |
+| `retinamnist` | Fundus Photography | Diabetic Retinopathy Grading | 5 | 28x28 / 224x224 | 1,080 / 120 / 400 |
+| `breastmnist` | Breast Ultrasound | Benign vs. Malignant Masses | 2 | 28x28 / 224x224 | 546 / 78 / 156 |
+| `organamnist` | Abdominal Computed Tomography (CT) | Multi-Organ Anatomical Classification | 11 | 28x28 / 224x224 | 34,581 / 6,491 / 17,778 |
+| `pathmnist` | Colorectal Histopathology | Tissue Morphology (Adenoma, Mucosa, Stroma) | 9 | 28x28 / 224x224 | 89,996 / 10,004 / 7,180 |
+| `covid` | Adult Chest X-Ray | Healthy vs. COVID-19 Infiltration | 2 | 224x224 | 10,616 / 1,516 / 3,033 |
+| `oasis` | Cross-Sectional Brain MRI | Cognitive Health vs. Dementia | 2 | 224x224 | 291 / 42 / 83 |
 
 ---
 
-## 7. Comprehensive Diagnostic Plotting Suite (39 Plots)
+## 7. 📈 Comprehensive Diagnostic Plotting Suite (39 Plots)
 
-After training or during `--eval_only` execution, `plots.py` renders up to 39 publication-grade diagnostic plots in `outputs/<dataset>/`:
+After training or during `--eval_only` execution, `plots.py` generates up to 39 diagnostic figures in `outputs/<dataset>/`:
 
 ```
 outputs/<dataset_name>/
@@ -561,7 +601,7 @@ outputs/<dataset_name>/
 ├── 07_quantum_saliency.png               # Pauli observable parameter-shift sensitivity gradients
 ├── 08_gradcam_overlays.png               # Anatomical Grad-CAM heatmaps on pathological regions
 ├── 09_shortcut_verification.png          # 4-Column audit: Original, Grad-CAM, Background, Foreground
-├── 10_conformal_intervals.png            # Conformal prediction set sizes across confidence intervals
+├── 10_conformal_intervals.png            # Conformal prediction set sizes across confidence levels
 ├── 11_tsne_embeddings.png                # Pre vs. post-training t-SNE latent representations
 ├── 12_umap_embeddings.png                # Pre vs. post-training UMAP manifold projections
 ├── 13_cosine_drift_histogram.png         # Feature cosine similarity drift during optimization
@@ -595,11 +635,11 @@ outputs/<dataset_name>/
 
 ---
 
-## 8. Troubleshooting & Common Engineering Pitfalls
+## 8. 🛠️ Troubleshooting & Common Engineering Pitfalls
 
 ### 1. Windows Unicode Encoding Errors (`cp1252`)
-- **Symptom:** `UnicodeEncodeError: 'charmap' codec can't encode character '\u2500'` when printing CLI status trees or box drawings on Windows.
-- **Solution:** Both `engine.py` and `app.py` force standard output streams to UTF-8 at startup:
+- **Symptom:** `UnicodeEncodeError: 'charmap' codec can't encode character '\u2500'` when printing box-drawing characters on Windows.
+- **Solution:** `engine.py` and `app.py` configure standard I/O streams to UTF-8 on startup:
   ```python
   import sys
   if hasattr(sys.stdout, 'reconfigure'):
@@ -607,21 +647,21 @@ outputs/<dataset_name>/
   ```
 
 ### 2. Host-to-Device Memory Thrashing & CUDA Out of Memory (OOM)
-- **Symptom:** System RAM spikes or training halts during evaluation.
-- **Solution:** 
-  1. Use `--cache_in_vram` only if GPU memory $\ge 8\text{ GB}$.
-  2. Cap OpenMP/MKL threads to 4 using environment variables (Section 4.4).
-  3. Pass `--fast_eval` to bypass 2D loss landscapes and heavy quantum noise simulations.
+- **Symptom:** Excessive RAM consumption or GPU OOM errors during training.
+- **Solution:**
+  1. Only pass `--cache_in_vram` if dedicated GPU memory is 8 GB or greater.
+  2. Restrict OpenMP and MKL thread pools to 4 (Section 4.4).
+  3. Pass `--fast_eval` to skip intensive 2D loss landscapes and multi-sample noise evaluations.
 
 ### 3. PennyLane Adjoint Differentiation Incompatibilities
-- **Symptom:** Gradient backpropagation errors when using `--diff_method adjoint` with trainable classical backbones.
-- **Solution:** Adjoint differentiation cannot backpropagate gradients into classical PyTorch modules. Always use the default backprop method:
+- **Symptom:** Gradient backpropagation errors when combining `--diff_method adjoint` with trainable classical backbones.
+- **Solution:** Adjoint differentiation cannot backpropagate gradients into classical PyTorch networks. Use the default PyTorch autograd backprop method:
   ```bash
   --diff_method backprop --qdevice default.qubit
   ```
 
 ### 4. Offline Model Loading for Hugging Face & OpenCLIP
-- **Symptom:** Network connection timeouts when attempting to load BiomedCLIP weights in restricted or isolated clinical environments.
+- **Symptom:** Network connection timeouts when loading BiomedCLIP weights in air-gapped clinical environments.
 - **Solution:** Ensure offline environment flags are set:
   ```bash
   export HF_HUB_OFFLINE=1
@@ -631,7 +671,7 @@ outputs/<dataset_name>/
 
 ---
 
-## Citation & Academic Reference
+## 9. 📜 Citation & Academic Reference
 
 If you use this hybrid quantum-classical framework, clinical calibration pipeline, or anti-shortcut suite in your research, please cite:
 
