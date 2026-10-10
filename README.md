@@ -677,9 +677,8 @@ If you use this hybrid quantum-classical framework, clinical calibration pipelin
 
 ```bibtex
 @article{qml_early_disease_prediction_2026,
-  title   = {Hybrid Classical-Quantum Convolutional Variational Circuits with Dual-Basis Readout and Anti-Shortcut Guarantees for Early Disease Prediction},
-  author  = {Advanced Quantum-Classical Clinical AI Research Consortium},
-  journal = {IEEE Transactions on Quantum Engineering / Medical Image Analysis},
+  title   = {Hybrid Classical-Quantum Convolutional Variational Circuits for Early Disease Prediction},
+  author  = {Vrushabh. V. Kandale},
   year    = {2026}
 }
 ```
