@@ -132,7 +132,7 @@ def _load_hybrid_model_from_checkpoint(
     if ckpt_path is None:
         return None
     try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         cfg = ckpt.get("config", {})
         state_dict = ckpt.get("model_state_dict", {})
         qw = state_dict.get("qlayer.weights", None)
@@ -182,7 +182,7 @@ def _load_classical_model_from_checkpoint(
     if ckpt_path is None:
         return None
     try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
         cfg = ckpt.get("config", {})
         model = ClassicalBaseline(
             in_channels=cfg.get("in_channels", 3),
@@ -1458,10 +1458,10 @@ def plot_quantum_kernel_gram(hybrid_res: Dict, meta: Dict, out_dir: str,
         genome = getattr(trained_model, "genome", None)
 
     if trained_weights is None:
-        # Fallback to random weights (legacy behavior)
-        shape = qml.StronglyEntanglingLayers.shape(n_layers=n_layers, n_wires=n_qubits)
-        rng = np.random.RandomState(42)
-        trained_weights = rng.normal(0, 0.01, size=shape)
+        raise ValueError(
+            "Quantum kernel diagnostic requires trained circuit weights; "
+            "random fallback kernels are not clinical evidence."
+        )
 
     weights_for_circuit = trained_weights
 
@@ -2057,8 +2057,7 @@ def compute_entanglement_entropy_epoch(model: HybridCNNVQC, loader,
         q_vals = q_vals + (1.0 - purity)
 
     q_mw = (2.0 / float(n_qubits)) * q_vals
-    s_eff = torch.maximum(s_cont, q_mw * float(n_a))
-    return float(s_eff.mean().item())
+    return float(s_cont.mean().item())
 
 
 def plot_entanglement_entropy(entropy_history: List[float], out_dir: str,
@@ -2068,6 +2067,8 @@ def plot_entanglement_entropy(entropy_history: List[float], out_dir: str,
     Fix (Flaw 6 & 8): Dynamic S_max based on actual n_qubits bipartite split
     instead of hardcoded 2.0. For n=4 → S_max=2.0 bits; for n=3 → S_max=1.0 bit.
     """
+    if not entropy_history or not np.isfinite(entropy_history).all():
+        raise ValueError("Observed finite entropy history is required")
     fig, ax = plt.subplots(figsize=(8, 4))
     epochs = range(1, len(entropy_history) + 1)
 
@@ -2080,10 +2081,15 @@ def plot_entanglement_entropy(entropy_history: List[float], out_dir: str,
     ax.plot(epochs, entropy_history, "-o", color="#9b59b6", linewidth=2, markersize=4,
             label="Empirical S(rho_A)")
 
-    # Confidence band
+    # Temporal variability, not a confidence interval over independent patients.
     entropy_arr = np.array(entropy_history)
     std = np.std(entropy_arr)
     ax.fill_between(epochs, entropy_arr - std, entropy_arr + std, alpha=0.15, color="#9b59b6")
+    with open(os.path.join(out_dir, "entanglement_entropy.json"), "w", encoding="utf-8") as handle:
+        json.dump({"measure": "bipartite_von_neumann_entropy_bits",
+                   "n_qubits": n_qubits, "maximum_bits": s_max,
+                   "values": entropy_arr.tolist(), "temporal_std": float(std),
+                   "range_bits": float(np.ptp(entropy_arr))}, handle, indent=2)
 
     ax.set_xlabel("Epoch")
     try:
@@ -2103,17 +2109,22 @@ def plot_entanglement_entropy(entropy_history: List[float], out_dir: str,
 def plot_zne_curves(model: HybridCNNVQC, loader, device: torch.device,
                     criterion=None, n_classes: int = 2, meta: Optional[Dict] = None, out_dir: str = "outputs",
                     scale_factors: List[float] = [1.0, 1.5, 2.0, 3.0, 5.0]):
-    """Quantum Zero-Noise Extrapolation via Depolarizing Channel Scaling (Fix: Defect 2).
+    """Heuristic noisy-accuracy extrapolation diagnostic.
 
     Previous implementation (CRITICAL FLAW): Added classical Gaussian noise to latent parameter
     vectors via torch.randn_like(z) * 0.1 * (scale - 1.0). This is NOT quantum noise.
 
-    Fixed implementation:
+    This is not physical ZNE because it extrapolates thresholded accuracy,
+    rather than linear Pauli expectations. It is retained only as a clearly
+    labelled robustness visualization.
+
+    Implementation:
     1. Uses qml.DepolarizingChannel on default.mixed device at scaled error probabilities
        p(λ) = p_base * λ (genuine quantum noise channel amplification).
-    2. Applies monotonicity gating: if expectation values don't decrease monotonically
+    2. Applies monotonicity gating: if measured accuracy doesn't decrease monotonically
        with noise scale, falls back to variance-weighted linear fit with physical ceiling.
-    3. For monotonic data, applies Richardson polynomial extrapolation (Temme et al., PRL 2017).
+    3. Fits a bounded heuristic curve to noisy accuracy; no error-mitigation
+       guarantee is claimed.
     """
     # Support backward-compatible 5-argument call: (model, loader, device, n_classes, out_dir)
     if isinstance(criterion, int) and isinstance(n_classes, str):
@@ -2247,13 +2258,13 @@ def plot_zne_curves(model: HybridCNNVQC, loader, device: torch.device,
                 zne_acc = float(exp_decay(0.0, a, b, c))
                 x_ext = np.linspace(0, max(scale_factors), 50)
                 y_ext = exp_decay(x_ext, a, b, c)
-                fit_label = f"Richardson Exponential (ZNE = {zne_acc:.4f})"
+                fit_label = f"Heuristic Exponential (accuracy@0 = {zne_acc:.4f})"
             except Exception:
                 coeffs = np.polyfit(scale_factors, accs, 1)
                 zne_acc = float(np.polyval(coeffs, 0.0))
                 x_ext = np.linspace(0, max(scale_factors), 50)
                 y_ext = np.polyval(coeffs, x_ext)
-                fit_label = f"Linear Extrapolation (ZNE = {zne_acc:.4f})"
+                fit_label = f"Heuristic Linear (accuracy@0 = {zne_acc:.4f})"
         else:
             # Non-monotonic: Variance-weighted linear fit with physical ceiling bound
             # Physical bound: zero-noise estimate ≤ max(measured) + 1.96 * σ / √N
@@ -2264,12 +2275,12 @@ def plot_zne_curves(model: HybridCNNVQC, loader, device: torch.device,
             zne_acc = min(zne_raw, physical_ceiling)
             x_ext = np.linspace(0, max(scale_factors), 50)
             y_ext = np.polyval(coeffs, x_ext)
-            fit_label = f"Variance-Bounded Linear (ZNE = {zne_acc:.4f}, NON-MONOTONIC)"
+            fit_label = f"Variance-Bounded Accuracy Fit (accuracy@0 = {zne_acc:.4f}, NON-MONOTONIC)"
     else:
         zne_acc = accs[0]
         x_ext = np.linspace(0, max(scale_factors), 50)
         y_ext = np.full_like(x_ext, zne_acc)
-        fit_label = f"Constant (ZNE = {zne_acc:.4f})"
+        fit_label = f"Constant Accuracy Baseline (accuracy@0 = {zne_acc:.4f})"
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(scale_factors, accs, "o-", color="#e74c3c", linewidth=2, markersize=8,
@@ -2278,7 +2289,7 @@ def plot_zne_curves(model: HybridCNNVQC, loader, device: torch.device,
     ax.plot(x_ext, y_ext, "--", color="#3498db", linewidth=1.5,
             label=fit_label)
     ax.plot(0, zne_acc, "*", color="#2ecc71", markersize=15,
-            label=f"Zero-Noise Estimate: {zne_acc:.4f}")
+            label=f"Heuristic Accuracy@0: {zne_acc:.4f}")
 
     # Monotonicity indicator
     if not is_monotonic:
@@ -2288,7 +2299,7 @@ def plot_zne_curves(model: HybridCNNVQC, loader, device: torch.device,
 
     ax.set_xlabel("Noise Scale Factor (λ)")
     ax.set_ylabel("Accuracy")
-    ax.set_title(f"Zero-Noise Extrapolation (ZNE) — {dataset_title}\n(Depolarizing Channel, Monotonicity-Gated)",
+    ax.set_title(f"Noisy-Accuracy Extrapolation (Heuristic) — {dataset_title}\n(Depolarizing Channel, No ZNE Guarantee)",
                  fontweight="bold")
     ax.legend(fontsize=9)
     ax.grid(True, alpha=0.3)
@@ -3976,7 +3987,7 @@ def plot_qfim_spectrum(evals: np.ndarray, out_dir: str):
     cond_num = float(pos_evals[0] / max(pos_evals[-1], 1e-12)) if len(pos_evals) > 0 else 0.0
 
     ax1.text(0.05, 0.15,
-             f"Rank (λ > 10⁻⁴): {rank}/{len(evals)}\nEff. Dimension: {d_eff:.2f}\nCond. Number: {cond_num:.1f}\nBarren Plateau Immunity: PASSED",
+             f"Rank (λ > 10⁻⁴): {rank}/{len(evals)}\nEff. Dimension: {d_eff:.2f}\nCond. Number: {cond_num:.1f}\nLocal geometry only; no immunity guarantee",
              transform=ax1.transAxes, fontsize=9, fontweight="bold",
              bbox=dict(boxstyle="round,pad=0.5", facecolor="#f4ecf7", edgecolor="#8e44ad", alpha=0.9))
 
@@ -4814,7 +4825,7 @@ def generate_all_diagnostic_plots(
     if kta_history is None:
         kta_history = hybrid_hist.get("kta_history", [0.1])
     if entropy_history is None:
-        entropy_history = hybrid_hist.get("entropy_history", [1.0])
+        entropy_history = hybrid_hist.get("entropy_history", [])
     if epoch_times_hybrid is None:
         epoch_times_hybrid = hybrid_hist.get("epoch_times", [1.0])
     if epoch_times_baseline is None:
@@ -4936,7 +4947,15 @@ def generate_all_diagnostic_plots(
         if val_loader is not None or test_loader is not None:
             try:
                 sc_loader = val_loader if val_loader is not None else test_loader
-                plot_shortcut_verification(hybrid_model, sc_loader, device, out_dir)
+                plot_shortcut_verification(
+                    hybrid_model,
+                    sc_loader,
+                    device,
+                    out_dir,
+                    dataset_name=(meta or {}).get("dataset_name"),
+                    expected_channels=(meta or {}).get("in_channels"),
+                    expected_image_size=(meta or {}).get("image_size"),
+                )
             except Exception as e:
                 print(f"  [warn] plot_shortcut_verification skipped: {e}")
 
@@ -5212,6 +5231,9 @@ def plot_shortcut_verification(
     device: Any = None,
     out_dir: str = ".",
     n_samples: int = 4,
+    dataset_name: Optional[str] = None,
+    expected_channels: Optional[int] = None,
+    expected_image_size: Optional[int] = None,
 ) -> float:
     """Diagnostic 4-column verification tool to quantify shortcut reliance.
     
@@ -5228,6 +5250,12 @@ def plot_shortcut_verification(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    if not dataset_name:
+        raise ValueError(
+            "Shortcut verification requires dataset_name provenance; refusing to "
+            "generate an unattributed clinical artifact."
+        )
+
     # Auto-load model from checkpoint if not provided
     if model is None:
         model = _load_hybrid_model_from_checkpoint(out_dir, device=device)
@@ -5238,13 +5266,29 @@ def plot_shortcut_verification(
     if val_loader is None:
         try:
             from dataset import get_medmnist_dataloaders
-            _, val_loader, _, _ = get_medmnist_dataloaders("pneumoniamnist", 16)
+            _, val_loader, _, _ = get_medmnist_dataloaders(dataset_name, 16)
         except Exception:
             pass
 
     if model is None or val_loader is None:
         print("[plots] Notice: plot_shortcut_verification skipped (model or val_loader unavailable).")
         return 0.0
+
+    dataset = getattr(val_loader, "dataset", None)
+    observed_channels = None
+    observed_height = None
+    observed_width = None
+    if dataset is not None and len(dataset) > 0:
+        sample = dataset[0][0] if isinstance(dataset[0], (tuple, list)) else dataset[0]
+        if torch.is_tensor(sample):
+            if sample.ndim == 2:
+                observed_channels, observed_height, observed_width = 1, *sample.shape
+            elif sample.ndim == 3:
+                observed_channels, observed_height, observed_width = sample.shape
+    if expected_channels is not None and observed_channels is not None and observed_channels != expected_channels:
+        raise ValueError(f"Shortcut diagnostic channel mismatch: observed={observed_channels}, expected={expected_channels}")
+    if expected_image_size is not None and observed_height is not None and observed_height != expected_image_size:
+        raise ValueError(f"Shortcut diagnostic image-size mismatch: observed={observed_height}, expected={expected_image_size}")
 
     model.eval()
 
@@ -5354,6 +5398,16 @@ def plot_shortcut_verification(
     out_path = os.path.join(out_dir, "shortcut_verification.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
+    provenance_path = os.path.join(out_dir, "shortcut_verification.json")
+    with open(provenance_path, "w", encoding="utf-8") as handle:
+        json.dump({
+            "dataset_name": dataset_name,
+            "observed_channels": observed_channels,
+            "observed_height": observed_height,
+            "observed_width": observed_width,
+            "n_samples": samples_collected,
+            "mean_shortcut_score": mean_shortcut_score,
+        }, handle, indent=2)
     print(f"[plots] Saved anti-shortcut diagnostic figure: {out_path}")
     return mean_shortcut_score
 
@@ -5363,39 +5417,32 @@ def plot_shortcut_verification(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _extract_vit_history(history: Optional[Dict]) -> Dict[str, Any]:
-    """Extract and validate metric arrays from ViT history or synthesize clean baseline contours."""
+    """Extract observed ViT metrics; never synthesize clinical measurements."""
     h = history or {}
-    epochs_count = len(h.get("train_loss", []))
-    if epochs_count == 0:
-        epochs_count = 10
-        epochs = np.arange(1, epochs_count + 1)
-        # Construct physically grounded baseline trajectory
-        train_loss = 0.65 * np.exp(-0.25 * (epochs - 1)) + 0.12
-        val_loss = 0.68 * np.exp(-0.20 * (epochs - 1)) + 0.16 + 0.015 * np.sin(epochs)
-        lr = 1e-5 * 0.5 * (1.0 + np.cos(np.pi * epochs / epochs_count))
-        grad_norms = 0.35 * np.exp(-0.15 * epochs) + 0.04
-        macro_auroc = 0.82 + 0.14 * (1.0 - np.exp(-0.35 * epochs))
-        auprc = 0.80 + 0.15 * (1.0 - np.exp(-0.32 * epochs))
-        macro_f1 = 0.78 + 0.16 * (1.0 - np.exp(-0.30 * epochs))
-        balanced_acc = 0.76 + 0.18 * (1.0 - np.exp(-0.30 * epochs))
-        cosine_drift = 0.005 * epochs + 0.001 * (epochs ** 1.3)
-        cosine_sim = 1.0 - cosine_drift
-        ece = 0.14 * np.exp(-0.25 * epochs) + 0.02
-        brier = 0.18 * np.exp(-0.22 * epochs) + 0.04
-    else:
-        epochs = np.arange(1, epochs_count + 1)
-        train_loss = np.array(h.get("train_loss", []))
-        val_loss = np.array(h.get("val_loss", []))
-        lr = np.array(h.get("lr", [1e-5] * epochs_count))
-        grad_norms = np.array(h.get("grad_norm", [0.05] * epochs_count))
-        macro_auroc = np.array(h.get("macro_auroc", [0.90] * epochs_count))
-        auprc = np.array(h.get("auprc", [0.88] * epochs_count))
-        macro_f1 = np.array(h.get("macro_f1", [0.85] * epochs_count))
-        balanced_acc = np.array(h.get("balanced_acc", [0.84] * epochs_count))
-        cosine_drift = np.array(h.get("cosine_drift", [0.03] * epochs_count))
-        cosine_sim = np.array(h.get("cosine_sim", 1.0 - cosine_drift))
-        ece = np.array(h.get("ece", 0.12 * np.exp(-0.2 * epochs) + 0.02))
-        brier = np.array(h.get("brier", 0.16 * np.exp(-0.18 * epochs) + 0.03))
+    required = (
+        "train_loss", "val_loss", "lr", "grad_norm", "macro_auroc", "auprc",
+        "macro_f1", "balanced_acc", "cosine_drift", "cosine_sim",
+    )
+    missing = [key for key in required if not h.get(key)]
+    if missing:
+        raise ValueError(f"Observed ViT history is missing metrics: {', '.join(missing)}")
+
+    epochs_count = len(h["train_loss"])
+    if any(len(h[key]) != epochs_count for key in required):
+        raise ValueError("Observed ViT history metric arrays have inconsistent lengths")
+    epochs = np.arange(1, epochs_count + 1)
+    train_loss = np.asarray(h["train_loss"], dtype=float)
+    val_loss = np.asarray(h["val_loss"], dtype=float)
+    lr = np.asarray(h["lr"], dtype=float)
+    grad_norms = np.asarray(h["grad_norm"], dtype=float)
+    macro_auroc = np.asarray(h["macro_auroc"], dtype=float)
+    auprc = np.asarray(h["auprc"], dtype=float)
+    macro_f1 = np.asarray(h["macro_f1"], dtype=float)
+    balanced_acc = np.asarray(h["balanced_acc"], dtype=float)
+    cosine_drift = np.asarray(h["cosine_drift"], dtype=float)
+    cosine_sim = np.asarray(h["cosine_sim"], dtype=float)
+    ece = np.asarray(h["ece"], dtype=float) if h.get("ece") else np.array([])
+    brier = np.asarray(h["brier"], dtype=float) if h.get("brier") else np.array([])
 
     return {
         "epochs": epochs,
@@ -5589,15 +5636,15 @@ def plot_vit_pre_post_umap(history: Optional[Dict], out_dir: str, **kwargs) -> N
 
 
 def plot_vit_cosine_similarity_drift_hist(history: Optional[Dict], out_dir: str, **kwargs) -> None:
-    """10. Representation Cosine Similarity Drift Histogram."""
+    """10. Observed representation cosine-similarity drift trajectory."""
     d = _extract_vit_history(history)
     fig, ax = plt.subplots(figsize=(7, 4.8))
-    drift_vals = np.clip(np.random.normal(loc=d["cosine_drift"][-1], scale=0.015, size=400), 0.0, 0.25)
-    sns.histplot(drift_vals, kde=True, color="#e67e22", bins=25, ax=ax)
-    ax.axvline(np.mean(drift_vals), color="#c0392b", linestyle="--", lw=2, label=f"Mean Drift ({np.mean(drift_vals):.4f})")
-    ax.set_xlabel("Cosine Similarity Drift $1 - \\cos(z_{\\mathrm{post}}, z_{\\mathrm{pre}})$", fontweight="bold")
-    ax.set_ylabel("Sample Density", fontweight="bold")
-    ax.set_title("BiomedCLIP ViT: Representation Drift Distribution", fontweight="bold")
+    ax.plot(d["epochs"], d["cosine_drift"], "-o", color="#e67e22", lw=2.2, label="Observed validation drift")
+    ax.axhline(float(np.mean(d["cosine_drift"])), color="#c0392b", linestyle="--", lw=2,
+               label=f"Mean Drift ({np.mean(d['cosine_drift']):.4f})")
+    ax.set_xlabel("Epoch", fontweight="bold")
+    ax.set_ylabel("Cosine Similarity Drift $1 - \\cos(z_{\\mathrm{post}}, z_{\\mathrm{pre}})$", fontweight="bold")
+    ax.set_title("BiomedCLIP ViT: Observed Representation Drift", fontweight="bold")
     ax.legend(loc="upper right")
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
@@ -5989,43 +6036,23 @@ def generate_all_vit_finetuning_plots(
     meta: Optional[Dict] = None,
     **kwargs: Any,
 ) -> Dict[str, str]:
-    """Master orchestrator generating all 32 BiomedCLIP ViT fine-tuning diagnostic plots."""
+    """Generate only ViT diagnostics backed by observed fine-tuning history.
+
+    Image-level attention, subgroup, OOD, saliency, and calibration plots are
+    intentionally omitted until their measured artifacts are supplied.  A
+    fabricated clinical plot is worse than a missing diagnostic.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    print(f"\n{'='*70}\n  GENERATING 32 BIOMEDCLIP VIT FINE-TUNING PLOTS ({out_dir}/)\n{'='*70}")
+    print(f"\n{'='*70}\n  GENERATING OBSERVED BIOMEDCLIP VIT FINE-TUNING PLOTS ({out_dir}/)\n{'='*70}")
 
     generators = [
         ("vit_train_val_loss_curve", lambda: plot_vit_train_val_loss_curve(history, out_dir)),
         ("vit_lr_schedule", lambda: plot_vit_lr_schedule(history, out_dir)),
         ("vit_layerwise_grad_norms", lambda: plot_vit_layerwise_grad_norms(history, out_dir)),
-        ("vit_multiclass_roc_curves", lambda: plot_vit_multiclass_roc_curves(history, out_dir, n_classes, meta)),
-        ("vit_precision_recall_curves", lambda: plot_vit_precision_recall_curves(history, out_dir, n_classes, meta)),
-        ("vit_normalized_confusion_matrix", lambda: plot_vit_normalized_confusion_matrix(history, out_dir, meta)),
         ("vit_f1_and_balanced_acc", lambda: plot_vit_f1_and_balanced_acc(history, out_dir)),
-        ("vit_pre_post_tsne", lambda: plot_vit_pre_post_tsne(history, out_dir, **kwargs)),
-        ("vit_pre_post_umap", lambda: plot_vit_pre_post_umap(history, out_dir, **kwargs)),
         ("vit_cosine_similarity_drift_hist", lambda: plot_vit_cosine_similarity_drift_hist(history, out_dir, **kwargs)),
-        ("vit_inter_intra_class_distance", lambda: plot_vit_inter_intra_class_distance(history, out_dir, **kwargs)),
-        ("vit_cls_attention_heatmaps", lambda: plot_vit_cls_attention_heatmaps(out_dir, **kwargs)),
-        ("vit_attention_shift_map", lambda: plot_vit_attention_shift_map(out_dir, **kwargs)),
-        ("vit_prediction_calibration_curve", lambda: plot_vit_calibration_curve(history, out_dir)),
         ("vit_generalization_gap", lambda: plot_vit_generalization_gap(history, out_dir)),
         ("vit_train_val_loss_ratio", lambda: plot_vit_train_val_loss_ratio(history, out_dir)),
-        ("vit_sample_efficiency_learning_curves", lambda: plot_vit_sample_efficiency_learning_curves(history, out_dir)),
-        ("vit_weight_displacement_trajectory", lambda: plot_vit_weight_displacement_trajectory(history, out_dir)),
-        ("vit_effective_rank_curve", lambda: plot_vit_effective_rank_curve(history, out_dir)),
-        ("vit_singular_value_spectrum", lambda: plot_vit_singular_value_spectrum(history, out_dir, **kwargs)),
-        ("vit_cka_layer_heatmap", lambda: plot_vit_cka_layer_heatmap(history, out_dir, **kwargs)),
-        ("vit_attention_entropy_per_layer", lambda: plot_vit_attention_entropy_per_layer(history, out_dir, **kwargs)),
-        ("vit_attention_frequency_energy", lambda: plot_vit_attention_frequency_energy(history, out_dir, **kwargs)),
-        ("vit_background_occlusion_sensitivity", lambda: plot_vit_background_occlusion_sensitivity(history, out_dir, **kwargs)),
-        ("vit_ood_performance_drop", lambda: plot_vit_ood_performance_drop(history, out_dir)),
-        ("vit_subgroup_disparity_chart", lambda: plot_vit_subgroup_disparity_chart(history, out_dir)),
-        ("vit_input_grad_norm_sensitivity", lambda: plot_vit_input_grad_norm_sensitivity(history, out_dir, **kwargs)),
-        ("vit_saliency_iou_roi", lambda: plot_vit_saliency_iou_roi(history, out_dir, **kwargs)),
-        ("vit_cross_site_domain_shift", lambda: plot_vit_cross_site_domain_shift(history, out_dir)),
-        ("vit_ece_brier_trajectory", lambda: plot_vit_ece_brier_trajectory(history, out_dir)),
-        ("vit_confidence_distribution_hist", lambda: plot_vit_confidence_distribution_hist(history, out_dir)),
-        ("vit_uncertainty_vs_error_scatter", lambda: plot_vit_uncertainty_vs_error_scatter(history, out_dir)),
     ]
 
     results = {}
@@ -6082,7 +6109,13 @@ if __name__ == "__main__":
     if args.shortcut_verification:
         try:
             dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            plot_shortcut_verification(model=None, val_loader=None, device=dev, out_dir=args.run_dir)
+            plot_shortcut_verification(
+                model=None,
+                val_loader=None,
+                device=dev,
+                out_dir=args.run_dir,
+                dataset_name=args.dataset,
+            )
         except Exception as e:
             print(f"[CLI] Notice: Standalone shortcut verification skipped: {e}")
 

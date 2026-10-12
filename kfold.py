@@ -56,13 +56,13 @@ try:
     from calibration import (
         _collect_val_logits, optimize_temperature_scaling, optimize_decision_threshold,
         QuantumBetaCalibrator, QuantumMultiClassCalibrator, optimize_multiclass_cost_sensitive_thresholds,
-        predict_with_cost_matrix
+        predict_with_cost_matrix, build_mondrian_conformal_artifact, split_calibration_indices
     )
 except ImportError:
     from qml_models.calibration import (
         _collect_val_logits, optimize_temperature_scaling, optimize_decision_threshold,
         QuantumBetaCalibrator, QuantumMultiClassCalibrator, optimize_multiclass_cost_sensitive_thresholds,
-        predict_with_cost_matrix
+        predict_with_cost_matrix, build_mondrian_conformal_artifact, split_calibration_indices
     )
 
 try:
@@ -242,29 +242,18 @@ def run_kfold_training(
     if enable_vit_finetuning:
         print("\n" + "!" * 70)
         print("[kfold/safety] WARNING: enable_vit_finetuning is active in K-Fold.")
-        print("[kfold/safety] Enforcing strict holdout quarantine to eliminate representation leakage.")
+        print("[kfold/safety] K-Fold will only consume a precomputed isolated ViT checkpoint.")
         print("!" * 70)
-        # Quarantine: Only fine-tune if a dedicated discovery set is provided; otherwise freeze
-        if 'n_discovery' in dir() and n_discovery > 64:
-            print("[info] Fine-tuning ViT strictly on isolated discovery partition...")
-            try:
-                from finetuning import finetune_biomedclip_vit, BiomedCLIPFineTuneConfig
-            except ImportError:
-                from qml_models.finetuning import finetune_biomedclip_vit, BiomedCLIPFineTuneConfig
-            ft_cfg = BiomedCLIPFineTuneConfig(
-                enable_finetuning=True,
-                dataset_name=dataset_name,
-                unfreeze_layers=vit_unfreeze_layers,
-                finetune_lr=vit_finetune_lr,
-                epochs=vit_epochs,
-                save_dir=biomedclip_dir,
-                device=str(device),
+        try:
+            from finetuning import has_finetuned_checkpoint
+        except ImportError:
+            from qml_models.finetuning import has_finetuned_checkpoint
+        if not has_finetuned_checkpoint(dataset_name, vit_unfreeze_layers, biomedclip_dir):
+            raise FileNotFoundError(
+                "K-Fold fine-tuning requires a precomputed isolated checkpoint. "
+                f"Expected dataset={dataset_name}, unfreeze_layers={vit_unfreeze_layers}, "
+                f"base_dir={biomedclip_dir}. Run finetuning.py separately on a discovery cohort first."
             )
-            print(f"[kfold/vit_finetune] Initiating isolated ViT fine-tuning ({vit_unfreeze_layers} layers, lr={vit_finetune_lr}, epochs={vit_epochs})...")
-            finetune_biomedclip_vit(ft_cfg, train_loader, val_loader=None, device=device)
-            print(f"[kfold/vit_finetune] Fine-tuned ViT weights saved to: {biomedclip_dir}/{dataset_name}_biomedclip_vit.pt\n")
-        else:
-            print("[info] Freezing ViT backbone to maintain strict out-of-fold generalization guarantees.")
     else:
         print(f"[kfold/vit] Using frozen pretrained BiomedCLIP backbone (zero label bleed, invariant representations).")
 
@@ -276,6 +265,10 @@ def run_kfold_training(
         dual_basis_only=dual_basis_readout,
         use_qaf_attention=use_qaf_attention,
         clinical_hard=clinical_hard,
+        finetune_backbone=enable_vit_finetuning,
+        ft_dataset_name=dataset_name,
+        ft_n_unfreeze=vit_unfreeze_layers,
+        ft_base_dir=biomedclip_dir,
     )
 
     # For K-fold we need the combined train+val features as our full dataset
@@ -285,9 +278,25 @@ def run_kfold_training(
     val_cache = os.path.join(cache_dir, "val.pt")
     test_cache = os.path.join(cache_dir, "test.pt")
 
-    cached_train = extract_and_cache_features(tmp_hybrid, train_loader, device, train_cache, cache_in_vram=False)
-    cached_val = extract_and_cache_features(tmp_hybrid, val_loader, device, val_cache, cache_in_vram=False)
-    cached_test = extract_and_cache_features(tmp_hybrid, test_loader, device, test_cache, cache_in_vram=cache_in_vram)
+    cache_common = {
+        "dataset_name": dataset_name,
+        "image_size": int(image_size),
+        "encoder_mode": cache_mode,
+        "finetune_layers": int(vit_unfreeze_layers) if enable_vit_finetuning else 0,
+        "finetune_dir": str(biomedclip_dir),
+    }
+    cached_train = extract_and_cache_features(
+        tmp_hybrid, train_loader, device, train_cache, cache_in_vram=False,
+        cache_metadata={**cache_common, "split": "train"},
+    )
+    cached_val = extract_and_cache_features(
+        tmp_hybrid, val_loader, device, val_cache, cache_in_vram=False,
+        cache_metadata={**cache_common, "split": "val"},
+    )
+    cached_test = extract_and_cache_features(
+        tmp_hybrid, test_loader, device, test_cache, cache_in_vram=cache_in_vram,
+        cache_metadata={**cache_common, "split": "test"},
+    )
 
     # Extract feature tensors from cached loaders
     train_features = cached_train.dataset.tensors[0]
@@ -721,6 +730,9 @@ def run_kfold_training(
         if not isinstance(cal_logits, torch.Tensor):
             cal_logits = torch.tensor(cal_logits)
         cal_labels_tensor = torch.tensor(cal_res["labels"])
+        cal_labels_np = np.asarray(cal_res["labels"]).astype(int)
+        cal_fit_idx, cal_score_idx = split_calibration_indices(cal_labels_np, seed=fold_seed)
+        cal_fit_tensor = torch.as_tensor(cal_fit_idx, dtype=torch.long)
 
         T_k = 1.0
         try:
@@ -734,31 +746,37 @@ def run_kfold_training(
 
         if n_classes == 2:
             beta_cal_k = QuantumBetaCalibrator()
-            beta_cal_k.fit(cal_probs_temp.detach(), cal_labels_tensor)
+            beta_cal_k.fit(cal_probs_temp[cal_fit_tensor].detach(), cal_labels_tensor[cal_fit_tensor])
             with torch.no_grad():
                 cal_probs_inner = beta_cal_k(cal_probs_temp).numpy()
             tau_k, _ = optimize_decision_threshold(
-                probs=cal_probs_inner,
-                labels=cal_res["labels"],
+                probs=cal_probs_inner[cal_fit_idx],
+                labels=cal_labels_np[cal_fit_idx],
                 criterion=threshold_criterion,
                 target_specificity=target_specificity,
                 cost_fp=cost_fp,
             )
         else:
             beta_cal_k = QuantumMultiClassCalibrator(n_classes=n_classes)
-            beta_cal_k.fit(cal_probs_temp.detach(), cal_labels_tensor)
+            beta_cal_k.fit(cal_probs_temp[cal_fit_tensor].detach(), cal_labels_tensor[cal_fit_tensor])
             with torch.no_grad():
                 cal_probs_inner = beta_cal_k(cal_probs_temp).numpy()
             if threshold_criterion in ("cost_sensitive", "target_specificity"):
                 tau_k = optimize_multiclass_cost_sensitive_thresholds(
-                    val_probs=cal_probs_inner,
-                    val_labels=cal_res["labels"],
+                    val_probs=cal_probs_inner[cal_fit_idx],
+                    val_labels=cal_labels_np[cal_fit_idx],
                     n_classes=n_classes,
                     target_specificity=target_specificity,
                     n_steps=200,
                 )
             else:
                 tau_k = None
+
+        conformal_scores_k = build_mondrian_conformal_artifact(
+            cal_probs_inner,
+            cal_labels_np[cal_score_idx],
+            alpha=0.05,
+        )
 
         # ── 4e. Apply calibrated parameters out-of-fold to fold_val_loader ────
         fold_val_result = evaluate(fold_hybrid, fold_val_loader, criterion, device, n_classes, max_samples=N_cv)
@@ -831,6 +849,19 @@ def run_kfold_training(
 
         # ── 4f. Save fold checkpoint with self-contained calibration ────
         if not kfold_no_ensemble:
+            def _fold_safe(value):
+                if isinstance(value, (np.floating, float)):
+                    return float(value)
+                if isinstance(value, (np.integer, int)):
+                    return int(value)
+                if isinstance(value, np.ndarray):
+                    return [_fold_safe(item) for item in value.tolist()]
+                if isinstance(value, (list, tuple)):
+                    return [_fold_safe(item) for item in value]
+                if isinstance(value, dict):
+                    return {str(key): _fold_safe(item) for key, item in value.items()}
+                return value
+
             fold_ckpt = {
                 "config": {
                     "in_channels": in_channels,
@@ -845,11 +876,20 @@ def run_kfold_training(
                     "image_size": image_size,
                     "use_qnas": use_qnas,
                     "qnas_genome": best_genome.to_dict() if best_genome is not None else None,
+                    "p_drop": 0.10,
+                    "q_init_std": q_init_std,
+                    "dual_basis_only": dual_basis_readout,
+                    "dual_basis_readout": dual_basis_readout,
+                    "use_qaf_attention": use_qaf_attention,
+                    "clinical_hard": clinical_hard,
+                    "preprocess_mode": "biomedclip_normalized",
+                    "class_order": list(range(n_classes)),
                 },
                 "calibration": {
                     "temperature": float(T_k),
                     "threshold": float(tau_k) if isinstance(tau_k, (float, int)) else ([float(x) for x in tau_k] if tau_k is not None else None),
                     "calibrator_type": "beta" if n_classes == 2 else "multiclass",
+                    "conformal_scores": conformal_scores_k,
                 },
                 "meta": {
                     "dataset_name": dataset_name,
@@ -861,8 +901,8 @@ def run_kfold_training(
                     "best_val_loss": float(best_fold_h_loss),
                 },
                 "model_state_dict": fold_hybrid.state_dict(),
-                "metrics": {k: float(v) if isinstance(v, (float, np.floating)) else v
-                           for k, v in fold_h_metrics.items()},
+                "calibrator_state_dict": {k: v.detach().cpu() for k, v in beta_cal_k.state_dict().items()},
+                 "metrics": _fold_safe(fold_h_metrics),
             }
             fold_ckpt_path = os.path.join(ckpt_dir, f"hybrid_fold_{fold_idx}.pt")
             torch.save(fold_ckpt, fold_ckpt_path)
@@ -999,12 +1039,13 @@ def run_kfold_training(
 
     ensemble_test_probs = np.zeros((n_test_samples, n_classes), dtype=np.float32)
     fold_tau_list = []
+    ensemble_conformal_scores = {str(class_idx): [] for class_idx in range(n_classes)}
     evaluated_folds = 0
 
     for k in range(n_folds):
         ckpt_path = os.path.join(ckpt_dir, f"hybrid_fold_{k}.pt")
         if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
             ckpt_depth = ckpt.get("config", {}).get("n_layers", n_layers)
             fold_h_test, _ = build_models(
                 in_channels, n_classes, n_qubits, ckpt_depth, device, dropout,
@@ -1034,6 +1075,22 @@ def run_kfold_training(
                     test_raw = test_raw[0]
                 T_k_val = ckpt.get("calibration", {}).get("temperature", 1.0)
                 cal_p = F.softmax(test_raw / max(T_k_val, 0.10), dim=1).cpu().numpy()
+                cal_meta = ckpt.get("calibration", {})
+                cal_state = ckpt.get("calibrator_state_dict")
+                if cal_state:
+                    if cal_meta.get("calibrator_type") == "beta":
+                        test_calibrator = QuantumBetaCalibrator()
+                    else:
+                        test_calibrator = QuantumMultiClassCalibrator(n_classes=n_classes)
+                    test_calibrator.load_state_dict(cal_state, strict=True)
+                    with torch.no_grad():
+                        cal_p = test_calibrator(torch.from_numpy(cal_p)).cpu().numpy()
+                fold_scores = ckpt.get("conformal_scores", cal_meta.get("conformal_scores", {}))
+                if isinstance(fold_scores, dict):
+                    for class_key, values in fold_scores.get("scores_by_class", {}).items():
+                        ensemble_conformal_scores.setdefault(str(class_key), []).extend(
+                            np.asarray(values, dtype=np.float32).reshape(-1).tolist()
+                        )
                 ensemble_test_probs += cal_p
                 evaluated_folds += 1
                 t_val = ckpt.get("calibration", {}).get("threshold", 0.5)
@@ -1048,7 +1105,15 @@ def run_kfold_training(
         mean_tau = float(np.mean(fold_tau_list)) if fold_tau_list else 0.50
         ensemble_test_preds = (ensemble_test_probs[:, 1] >= mean_tau).astype(int)
     else:
-        ensemble_test_preds = np.argmax(ensemble_test_probs, axis=1)
+        if fold_tau_list and all(isinstance(t, (list, tuple, np.ndarray)) for t in fold_tau_list):
+            mean_tau = np.mean(np.asarray(fold_tau_list, dtype=np.float32), axis=0)
+            ensemble_test_preds = np.argmax(ensemble_test_probs, axis=1)
+            for i in range(len(ensemble_test_preds)):
+                valid_cls = np.flatnonzero(ensemble_test_probs[i] >= mean_tau)
+                if len(valid_cls):
+                    ensemble_test_preds[i] = int(valid_cls[np.argmax(ensemble_test_probs[i, valid_cls])])
+        else:
+            ensemble_test_preds = np.argmax(ensemble_test_probs, axis=1)
 
     ensemble_test_metrics = compute_clinical_metrics(test_labels_np, ensemble_test_preds, ensemble_test_probs, n_classes)
     print("\n── 5-Fold Calibrated Ensemble Metrics on External Holdout (cached_test) ──")
@@ -1087,6 +1152,29 @@ def run_kfold_training(
         "ensemble_checkpoints": [
             os.path.join(ckpt_dir, f"hybrid_fold_{k}.pt") for k in range(n_folds)
         ] if not kfold_no_ensemble else [],
+    }
+    if fold_tau_list:
+        summary["mean_optimal_threshold"] = _clean_json_val(
+            np.mean(np.asarray(fold_tau_list, dtype=np.float32), axis=0)
+        )
+    temp_values = []
+    for k in range(n_folds):
+        ckpt_probe = os.path.join(ckpt_dir, f"hybrid_fold_{k}.pt")
+        if os.path.exists(ckpt_probe):
+            temp_values.append(float(torch.load(
+                ckpt_probe, map_location="cpu", weights_only=True,
+            ).get("calibration", {}).get("temperature", 1.0)))
+    summary["mean_temperature"] = float(np.mean(temp_values)) if temp_values else 1.0
+    summary["conformal_scores"] = {
+        "method": "mondrian_split_conformal",
+        "alpha": 0.05,
+        "n_classes": n_classes,
+        "scores_by_class": ensemble_conformal_scores,
+        "quantiles": {
+            key: float(np.quantile(values, min(1.0, np.ceil((len(values) + 1) * 0.95) / len(values)), method="higher"))
+            if values else 1.0
+            for key, values in ensemble_conformal_scores.items()
+        },
     }
     summary_path = os.path.join(kfold_dir, "kfold_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:

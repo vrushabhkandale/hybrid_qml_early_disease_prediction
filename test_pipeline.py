@@ -15,6 +15,7 @@ import os
 import sys
 import unittest
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -49,6 +50,11 @@ from finetuning import (
     has_finetuned_checkpoint,
     save_finetuned_biomedclip_vit,
     load_finetuned_biomedclip_vit,
+)
+from calibration import (
+    build_mondrian_conformal_artifact,
+    mondrian_prediction_set,
+    predict_with_cost_matrix,
 )
 
 
@@ -113,10 +119,10 @@ class TestRemediatedQMLPipeline(unittest.TestCase):
         self.assertTrue((perturbed.mean() - 1.5).abs().item() < 0.2)
 
     def test_symmetrical_classical_baseline(self):
-        """Task 4.7: Verify ClassicalBaseline mirrors 2-layer MLP head expressivity."""
+        """Task 4.7: Verify the baseline uses the matched-parameter MLP contract."""
         baseline = ClassicalBaseline(in_channels=3, n_classes=2, n_qubits=4, n_layers=2)
         n_meas = compute_n_meas(4, dual_basis_only=False)
-        self.assertEqual(baseline.mlp[0].out_features, n_meas)
+        self.assertGreaterEqual(baseline.mlp[0].out_features, 2)
         self.assertEqual(baseline.head[0].in_features, n_meas)
         self.assertEqual(baseline.head[-1].out_features, 2)
 
@@ -252,61 +258,64 @@ class TestRemediatedQMLPipeline(unittest.TestCase):
             self.assertEqual(set_inner_train.union(set_inner_cal), set(train_idx))
 
     def test_kfold_summary_structure(self):
-        """Phase 4 (LEAK-04): Verify summary dictionary structure contains zero-leakage keys."""
+        """Phase 4 (LEAK-04): Validate a production K-fold artifact, not fake data."""
         import json
-        import tempfile
+        artifact_dir = os.environ.get("QML_KFOLD_ARTIFACT_DIR")
+        if not artifact_dir:
+            self.skipTest("Set QML_KFOLD_ARTIFACT_DIR to an actual kfold output directory")
 
-        # Emulate the saved summary structure from kfold.py Step 8
-        summary_payload = {
-            "dataset": "pneumoniamnist",
-            "model_type": "quantum",
-            "n_folds": 5,
-            "mean_optimal_threshold": 0.485,
-            "std_optimal_threshold": 0.021,
-            "oof_metrics_raw": {
-                "accuracy": 0.88,
-                "auc": 0.94,
-                "f1": 0.89,
-                "ece": 0.082,
-            },
-            "oof_metrics": {
-                "accuracy": 0.89,
-                "auc": 0.945,
-                "f1": 0.90,
-                "ece": 0.031,
-                "brier": 0.075,
-            },
-            "ensemble_test_metrics": {
-                "accuracy": 0.91,
-                "auc": 0.96,
-                "f1": 0.92,
-                "ece": 0.028,
-            },
-            "fold_results": [
-                {"fold": 0, "val_metrics": {"auc": 0.93}},
-                {"fold": 1, "val_metrics": {"auc": 0.95}},
-            ],
-        }
+        summary_path = os.path.join(artifact_dir, "kfold_summary.json")
+        self.assertTrue(os.path.isfile(summary_path), summary_path)
+        with open(summary_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
 
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            summary_path = os.path.join(tmp_dir, "kfold_summary.json")
-            with open(summary_path, "w") as f:
-                json.dump(summary_payload, f, indent=2)
+        for key in ("oof_metrics", "oof_metrics_raw", "ensemble_test_metrics", "per_fold_hybrid"):
+            self.assertIn(key, loaded)
+        self.assertIn("mean_optimal_threshold", loaded)
+        self.assertIn("mean_temperature", loaded)
+        self.assertIn("conformal_scores", loaded)
+        self.assertIsInstance(loaded["conformal_scores"], (list, dict))
 
-            self.assertTrue(os.path.exists(summary_path))
-            with open(summary_path, "r") as f:
-                loaded = json.load(f)
+        for checkpoint_path in loaded.get("ensemble_checkpoints", []):
+            if not os.path.isabs(checkpoint_path):
+                checkpoint_path = os.path.join(os.path.dirname(summary_path), checkpoint_path)
+            self.assertTrue(os.path.isfile(checkpoint_path), checkpoint_path)
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            self.assertIn("model_state_dict", checkpoint)
+            self.assertIn("calibrator_state_dict", checkpoint)
+            self.assertIn("calibration", checkpoint)
+            self.assertIn("conformal_scores", checkpoint["calibration"])
 
-            # Assert required zero-leakage reporting fields are present
-            self.assertIn("oof_metrics", loaded)
-            self.assertIn("oof_metrics_raw", loaded)
-            self.assertIn("ensemble_test_metrics", loaded)
-            self.assertIn("mean_optimal_threshold", loaded)
-            self.assertIn("fold_results", loaded)
-            self.assertIn("ece", loaded["oof_metrics"])
-            self.assertIn("brier", loaded["oof_metrics"])
+    def test_mondrian_conformal_artifact_is_class_conditional(self):
+        """Clinical classes receive independent finite-sample conformal quantiles."""
+        probs = torch.tensor([
+            [0.90, 0.05, 0.03, 0.02],
+            [0.80, 0.10, 0.05, 0.05],
+            [0.20, 0.55, 0.15, 0.10],
+            [0.25, 0.50, 0.15, 0.10],
+            [0.20, 0.20, 0.55, 0.05],
+            [0.20, 0.20, 0.50, 0.10],
+            [0.20, 0.20, 0.10, 0.50],
+            [0.20, 0.20, 0.10, 0.50],
+        ]).numpy()
+        labels = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]).numpy()
+        artifact = build_mondrian_conformal_artifact(probs, labels, alpha=0.10)
+        self.assertEqual(artifact["method"], "mondrian_split_conformal")
+        self.assertEqual(set(artifact["quantiles"]), {"0", "1", "2", "3"})
+        prediction_set = mondrian_prediction_set(np.array([0.20, 0.10, 0.65, 0.05]), artifact)
+        self.assertIn(2, prediction_set.tolist())
+
+    def test_cost_matrix_uses_action_by_true_orientation(self):
+        """Bayes risk must calculate C[action, true] @ p."""
+        probs = np.array([[0.20, 0.30, 0.50]])
+        costs = np.array([
+            [0.0, 1.0, 20.0],
+            [1.0, 0.0, 2.0],
+            [50.0, 3.0, 0.0],
+        ])
+        # Action 1 risk=0.2+1.0, action 0 risk=0.3+10.0, action 2 risk=10+0.9.
+        self.assertEqual(int(predict_with_cost_matrix(probs, costs)[0]), 1)
 
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import pickle
 from pathlib import Path
 import sys
 import time
@@ -68,6 +69,74 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _checkpoint_safe_value(value: Any) -> Any:
+    """Convert checkpoint metadata to primitives accepted by safe torch loading."""
+    if isinstance(value, np.ndarray):
+        return [_checkpoint_safe_value(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return _checkpoint_safe_value(value.item())
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {str(key): _checkpoint_safe_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_checkpoint_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _load_finetuned_checkpoint(path: Path, map_location: torch.device) -> Dict[str, Any]:
+    """Load a fine-tuned checkpoint with a safe legacy-NumPy compatibility path.
+
+    Older checkpoints stored NumPy arrays inside diagnostic metadata.  The
+    tensors themselves are safe, but PyTorch's ``weights_only`` unpickler
+    rejects those legacy NumPy globals.  We explicitly allow only NumPy array,
+    dtype, reconstruction, and concrete scalar dtype classes; arbitrary
+    application classes are never allowlisted.
+    """
+    try:
+        return torch.load(str(path), map_location=map_location, weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError) as exc:
+        safe_items = [
+            np.ndarray,
+            np.dtype,
+        ]
+        numpy_core = getattr(np, "_core", getattr(np, "core", None))
+        multiarray = getattr(numpy_core, "multiarray", None) if numpy_core is not None else None
+        reconstruct = getattr(multiarray, "_reconstruct", None)
+        if reconstruct is not None:
+            safe_items.append(reconstruct)
+        for dtype_name in (
+            "BoolDType", "Int8DType", "Int16DType", "Int32DType", "Int64DType",
+            "UInt8DType", "UInt16DType", "UInt32DType", "UInt64DType",
+            "Float16DType", "Float32DType", "Float64DType",
+        ):
+            dtype_cls = getattr(getattr(np, "dtypes", None), dtype_name, None)
+            if dtype_cls is not None:
+                safe_items.append(dtype_cls)
+        for dtype_value in (
+            np.bool_, np.int8, np.int16, np.int32, np.int64,
+            np.uint8, np.uint16, np.uint32, np.uint64,
+            np.float16, np.float32, np.float64,
+        ):
+            safe_items.append(type(np.dtype(dtype_value)))
+        try:
+            with torch.serialization.safe_globals(safe_items):
+                checkpoint = torch.load(str(path), map_location=map_location, weights_only=True)
+            logger.warning(
+                "Loaded legacy fine-tuned checkpoint with restricted NumPy safe globals: %s",
+                path,
+            )
+            return checkpoint
+        except Exception as safe_exc:
+            raise RuntimeError(
+                f"Fine-tuned checkpoint {path} is not safe-loadable. Re-save it with the "
+                "current finetuning.py checkpoint writer. Original error: "
+                f"{exc}; restricted-load error: {safe_exc}"
+            ) from safe_exc
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -93,6 +162,10 @@ class BiomedCLIPFineTuneConfig:
     warmup_epochs: int = 3
     batch_size: int = 32
     save_filename: Optional[str] = None
+    # The workspace dataset loaders already emit BiomedCLIP-normalized tensors.
+    # Keep the preprocessing owner explicit so fine-tuning cannot silently
+    # double-normalize those tensors.
+    preprocess_mode: str = "biomedclip_normalized"
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
 
     def get_save_path(self, base_dir: Optional[str] = None) -> str:
@@ -204,8 +277,8 @@ def get_finetuned_checkpoint_path(
     """Resolve candidate file path for a dataset-specific fine-tuned ViT checkpoint."""
     root = Path(base_dir) if base_dir else Path(FINETUNED_DIR)
     candidates = [
-        root / dataset_name / f"biomedclip_vit_unfreeze{n_unfreeze}.pt",
         root / f"{dataset_name}_biomedclip_vit.pt",
+        root / dataset_name / f"biomedclip_vit_unfreeze{n_unfreeze}.pt",
         root / f"{dataset_name}_vit_unfreeze{n_unfreeze}.pt",
         root / dataset_name / "best_vit.pt",
     ]
@@ -223,8 +296,8 @@ def has_finetuned_checkpoint(
     """Check whether a fine-tuned checkpoint exists for the given dataset."""
     root = Path(base_dir) if base_dir else Path(FINETUNED_DIR)
     candidates = [
-        root / dataset_name / f"biomedclip_vit_unfreeze{n_unfreeze}.pt",
         root / f"{dataset_name}_biomedclip_vit.pt",
+        root / dataset_name / f"biomedclip_vit_unfreeze{n_unfreeze}.pt",
         root / f"{dataset_name}_vit_unfreeze{n_unfreeze}.pt",
         root / dataset_name / "best_vit.pt",
     ]
@@ -254,8 +327,8 @@ def save_finetuned_backbone(
         "unfreeze_layers": n_unfreeze,
         "finetuned_state_dict": finetuned_state,
         "visual_state_dict": {k: v.detach().cpu().clone() for k, v in vision_encoder.state_dict().items()},
-        "metadata": metadata or {},
-        "metrics": metadata or {},
+        "metadata": _checkpoint_safe_value(metadata or {}),
+        "metrics": _checkpoint_safe_value(metadata or {}),
     }
 
     torch.save(checkpoint, str(ckpt_path))
@@ -294,10 +367,25 @@ def load_finetuned_backbone(
         raise FileNotFoundError(f"No fine-tuned checkpoint found at {ckpt_path}")
 
     target_dev = torch.device(device) if device else next(vision_encoder.parameters()).device
-    checkpoint = torch.load(str(ckpt_path), map_location=target_dev, weights_only=False)
+    checkpoint = _load_finetuned_checkpoint(ckpt_path, target_dev)
 
     loaded_count = 0
-    if "finetuned_state_dict" in checkpoint:
+    if "visual_state_dict" in checkpoint:
+        visual_state = {
+            k: v for k, v in checkpoint["visual_state_dict"].items()
+            if k in vision_encoder.state_dict()
+            and vision_encoder.state_dict()[k].shape == v.shape
+        }
+        if not visual_state:
+            raise RuntimeError("No compatible visual_state_dict parameters found in fine-tuned checkpoint")
+        missing, unexpected = vision_encoder.load_state_dict(visual_state, strict=False)
+        loaded_count = len(visual_state) - len(unexpected)
+        if loaded_count < len(vision_encoder.state_dict()) * 0.5:
+            raise RuntimeError(
+                f"FATAL: Only {loaded_count}/{len(vision_encoder.state_dict())} "
+                "parameters loaded from visual_state_dict checkpoint."
+            )
+    elif "finetuned_state_dict" in checkpoint:
         raw_state = checkpoint["finetuned_state_dict"]
         model_keys = set(vision_encoder.state_dict().keys())
 
@@ -330,9 +418,6 @@ def load_finetuned_backbone(
                 f"{len(missing)} parameters not loaded from checkpoint: {missing[:5]}..."
             )
         loaded_count = len(cleaned_state)
-    elif "visual_state_dict" in checkpoint:
-        vision_encoder.load_state_dict(checkpoint["visual_state_dict"], strict=False)
-        loaded_count = len(checkpoint["visual_state_dict"])
     else:
         vision_encoder.load_state_dict(checkpoint, strict=False)
         loaded_count = len(checkpoint)
@@ -530,11 +615,18 @@ def compute_comprehensive_metrics(
 # ---------------------------------------------------------------------------
 # Robust Preprocessing & Loss Utilities
 # ---------------------------------------------------------------------------
-def robust_biomedclip_preprocess(images: torch.Tensor, device: torch.device) -> torch.Tensor:
+def robust_biomedclip_preprocess(
+    images: torch.Tensor,
+    device: torch.device,
+    preprocess_mode: str = "biomedclip_normalized",
+) -> torch.Tensor:
     """
-    Deterministically standardize any image tensor into BiomedCLIP distribution.
-    Handles: uint8 [0,255], float [0,1], float [0,>1], grayscale (C=1), RGB (C=3).
-    No silent bypass — always applies mean/std normalization.
+    Convert an image batch according to one explicit preprocessing contract.
+
+    ``dataset.py`` owns normalization in the main pipeline, so the default
+    ``biomedclip_normalized`` mode only performs channel/spatial validation and
+    never applies mean/std a second time. Raw callers may request
+    ``raw_uint8`` or ``raw_float01`` explicitly.
     """
     images = images.to(device=device, dtype=torch.float32, non_blocking=True)
 
@@ -548,10 +640,24 @@ def robust_biomedclip_preprocess(images: torch.Tensor, device: torch.device) -> 
     if images.shape[-2:] != (224, 224):
         images = F.interpolate(images, size=(224, 224), mode="bilinear", align_corners=False)
 
-    # 3. Removed dynamic domain detection to prevent standardized data corruption.
-    # We assume `images` are already in [0, 1] range or normalized appropriately.
+    if preprocess_mode == "biomedclip_normalized":
+        if not torch.isfinite(images).all():
+            raise ValueError("BiomedCLIP-normalized batch contains NaN/Inf values.")
+        return images
+    if preprocess_mode not in {"raw_uint8", "raw_float01"}:
+        raise ValueError(
+            f"Unknown preprocessing mode '{preprocess_mode}'. "
+            "Use biomedclip_normalized, raw_uint8, or raw_float01."
+        )
 
-    # 4. Channel-wise standardization — ALWAYS applied unconditionally
+    if preprocess_mode == "raw_uint8":
+        if images.min().item() < 0.0 or images.max().item() > 255.0:
+            raise ValueError("raw_uint8 input must be in [0, 255].")
+        images = images / 255.0
+    elif images.min().item() < 0.0 or images.max().item() > 1.0:
+        raise ValueError("raw_float01 input must be in [0, 1].")
+
+    # Explicit raw-input normalization owner.
     mean = torch.tensor(BIOMEDCLIP_MEAN, device=device).view(1, 3, 1, 1)
     std = torch.tensor(BIOMEDCLIP_STD, device=device).view(1, 3, 1, 1)
     return (images - mean) / std
@@ -614,6 +720,7 @@ def finetune_biomedclip(
     base_dir: Optional[str] = None,
     save_checkpoint: bool = True,
     verbose: bool = True,
+    preprocess_mode: str = "biomedclip_normalized",
 ) -> Dict[str, Any]:
     """Execute isolated fine-tuning on BiomedCLIP ViT with real-time progress and diagnostics."""
     if device is None:
@@ -659,7 +766,7 @@ def finetune_biomedclip(
                 imgs = b[0] if isinstance(b, (list, tuple)) else b.get("image", b.get("images"))
                 if imgs is None:
                     continue
-                imgs = robust_biomedclip_preprocess(imgs, device)
+                imgs = robust_biomedclip_preprocess(imgs, device, preprocess_mode)
                 ref_imgs_list.append(imgs)
                 if sum(x.shape[0] for x in ref_imgs_list) >= 128:
                     break
@@ -722,7 +829,7 @@ def finetune_biomedclip(
             else:
                 continue
 
-            images = robust_biomedclip_preprocess(images, device)
+            images = robust_biomedclip_preprocess(images, device, preprocess_mode)
             labels = labels.to(device).long()
             if labels.ndim > 1:
                 labels = labels.squeeze(-1) if labels.shape[-1] == 1 else labels.squeeze()
@@ -792,7 +899,7 @@ def finetune_biomedclip(
                 else:
                     continue
 
-                imgs = robust_biomedclip_preprocess(imgs, device)
+                imgs = robust_biomedclip_preprocess(imgs, device, preprocess_mode)
                 lbls = lbls.to(device).long()
                 if lbls.ndim > 1:
                     lbls = lbls.squeeze(-1) if lbls.shape[-1] == 1 else lbls.squeeze()
@@ -879,6 +986,7 @@ def finetune_biomedclip(
             "lr": lr,
             "epochs": epochs,
             "warmup_epochs": warmup_epochs,
+            "preprocess_mode": preprocess_mode,
             "best_val_loss": best_val_loss,
             "final_metrics": metrics,
             "history": history,
@@ -969,6 +1077,7 @@ def finetune_biomedclip_vit(
         base_dir=config.save_dir,
         save_checkpoint=True,
         verbose=kwargs.get("verbose", True),
+        preprocess_mode=config.preprocess_mode,
     )
     return visual_model, res
 

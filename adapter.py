@@ -690,7 +690,7 @@ def load_adapter_checkpoint(
         raise FileNotFoundError(f"Adapter checkpoint not found at: {checkpoint_path}")
 
     device = device or torch.device("cpu")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
 
     backbone = backbone_or_model.backbone if hasattr(backbone_or_model, "backbone") else backbone_or_model
 

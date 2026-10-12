@@ -14,7 +14,7 @@ Modularized calibration routines for Quantum-Classical Neural Networks:
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -261,8 +261,11 @@ def optimize_multiclass_cost_sensitive_thresholds(
     if cost_matrix is not None:
         cost_matrix = np.asarray(cost_matrix)
         for c in range(n_classes):
-            cost_fn = float(np.mean(cost_matrix[c, [j for j in range(n_classes) if j != c]]))
-            cost_fp = float(np.mean(cost_matrix[[j for j in range(n_classes) if j != c], c]))
+            other = [j for j in range(n_classes) if j != c]
+            # C[action, true]: FN for true c predicted as another action;
+            # FP for another true class predicted as action c.
+            cost_fn = float(np.mean(cost_matrix[other, c]))
+            cost_fp = float(np.mean(cost_matrix[c, other]))
             class_risk = cost_fn * fn[c] + cost_fp * fp[c]  # (S,)
             valid_spec = np.where(spec[c] >= target_specificity)[0]
             if len(valid_spec) > 0:
@@ -288,12 +291,115 @@ def optimize_multiclass_cost_sensitive_thresholds(
 def predict_with_cost_matrix(probs: np.ndarray, cost_matrix: np.ndarray) -> np.ndarray:
     """Compute risk-minimal prediction vector given posterior probabilities and clinical cost matrix.
 
-    R(k | x) = sum_j probs[i, j] * cost_matrix[j, k]
+    ``cost_matrix[action, true_class]`` is the cost convention used by the
+    training engine. Therefore ``R(action | x) = C @ p``; multiplying on the
+    other side silently transposes the clinical policy.
     """
     probs = np.asarray(probs)
     cost_matrix = np.asarray(cost_matrix)
-    expected_risk = np.matmul(probs, cost_matrix)
+    if probs.ndim != 2 or cost_matrix.ndim != 2:
+        raise ValueError("probs and cost_matrix must both be rank-2 arrays")
+    if probs.shape[1] != cost_matrix.shape[1] or cost_matrix.shape[0] != cost_matrix.shape[1]:
+        raise ValueError(
+            f"Expected probs shape (N,K) and square cost matrix (K,K), got "
+            f"{probs.shape} and {cost_matrix.shape}"
+        )
+    expected_risk = np.matmul(probs, cost_matrix.T)
     return np.argmin(expected_risk, axis=1)
+
+
+def build_mondrian_conformal_artifact(
+    probabilities: np.ndarray,
+    labels: np.ndarray,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Build finite-sample class-conditional split-conformal artifacts.
+
+    Scores and quantiles are kept per true class.  This avoids allowing a
+    large/easy class to determine the prediction-set threshold for a rare or
+    clinically ambiguous class.
+    """
+    if not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    probs = np.asarray(probabilities, dtype=np.float64)
+    labels = np.asarray(labels).reshape(-1).astype(int)
+    if probs.ndim != 2 or probs.shape[0] != labels.size:
+        raise ValueError(f"Expected probabilities (N,K) and labels (N,), got {probs.shape}, {labels.shape}")
+    if not np.isfinite(probs).all():
+        raise ValueError("probabilities contain NaN/Inf values")
+    n_classes = probs.shape[1]
+    if np.any(labels < 0) or np.any(labels >= n_classes):
+        raise ValueError("labels must be valid probability-column indices")
+    if np.any(probs < 0) or np.any(probs > 1) or not np.allclose(probs.sum(axis=1), 1.0, atol=1e-5):
+        raise ValueError("probability rows must be nonnegative and sum to one")
+    scores_by_class: Dict[str, list[float]] = {}
+    quantiles: Dict[str, float] = {}
+    for class_idx in range(n_classes):
+        class_scores = (1.0 - probs[labels == class_idx, class_idx]).astype(np.float64)
+        class_scores = np.clip(class_scores, 0.0, 1.0)
+        key = str(class_idx)
+        scores_by_class[key] = class_scores.tolist()
+        if class_scores.size == 0:
+            quantiles[key] = 1.0
+            continue
+        quantiles[key] = conformal_quantile(class_scores, alpha)
+    return {
+        "method": "mondrian_split_conformal",
+        "alpha": float(alpha),
+        "n_classes": int(n_classes),
+        "scores_by_class": scores_by_class,
+        "quantiles": quantiles,
+    }
+
+
+def mondrian_prediction_set(
+    probabilities: np.ndarray,
+    artifact: Optional[Dict[str, Any]],
+    alpha: Optional[float] = None,
+) -> np.ndarray:
+    """Apply a persisted Mondrian conformal artifact to one probability vector."""
+    probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    if probs.size == 0 or not np.isfinite(probs).all():
+        raise ValueError("probabilities must be a non-empty finite vector")
+    if not artifact or "quantiles" not in artifact:
+        return np.asarray([int(np.argmax(probs))], dtype=int)
+    if alpha is not None and abs(float(artifact.get("alpha", alpha)) - float(alpha)) > 1e-9:
+        raise ValueError("Requested alpha does not match persisted conformal artifact")
+    quantiles = artifact["quantiles"]
+    selected = [
+        class_idx for class_idx, probability in enumerate(probs)
+        if float(probability) >= 1.0 - float(quantiles.get(str(class_idx), 1.0)) - 1e-12
+    ]
+    return np.asarray(selected, dtype=int)
+
+
+def conformal_quantile(scores: np.ndarray, alpha: float = 0.05) -> float:
+    """Exact split-conformal order statistic, with conservative sparse-class handling."""
+    if not 0 < alpha < 1:
+        raise ValueError("alpha must be in (0, 1)")
+    values = np.asarray(scores, dtype=float).reshape(-1)
+    if not np.isfinite(values).all() or np.any(values < 0) or np.any(values > 1):
+        raise ValueError("conformal scores must be finite and in [0, 1]")
+    rank = int(np.ceil((len(values) + 1) * (1 - alpha)))
+    if rank > len(values) or not len(values):
+        return 1.0  # Equivalent to +infinity for bounded 1-p scores.
+    return float(np.partition(values, rank - 1)[rank - 1])
+
+
+def split_calibration_indices(labels: np.ndarray, seed: int = 42) -> Tuple[np.ndarray, np.ndarray]:
+    """Separate probability-calibrator fitting from conformal-score estimation."""
+    labels = np.asarray(labels).reshape(-1)
+    rng = np.random.default_rng(seed)
+    fit_indices, score_indices = [], []
+    for class_idx in np.unique(labels):
+        indices = rng.permutation(np.flatnonzero(labels == class_idx))
+        if len(indices) < 2:
+            fit_indices.extend(indices.tolist())
+        else:
+            split = max(1, len(indices) // 2)
+            fit_indices.extend(indices[:split].tolist())
+            score_indices.extend(indices[split:].tolist())
+    return np.asarray(sorted(fit_indices), dtype=int), np.asarray(sorted(score_indices), dtype=int)
 
 
 def optimize_decision_threshold(

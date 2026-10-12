@@ -62,47 +62,187 @@ def configure_offline_mode(hf_offline: bool = True, fix_stdout_encoding: bool = 
 class ImagePreprocessMode(Enum):
     """Explicit preprocessing contract for BiomedCLIP input normalization (Fix: H-04).
 
-    RAW_UINT8       : tensor values are integers in [0, 255].
-    RAW_FLOAT01     : tensor values are floats in [0.0, 1.0].
-    BIOMEDCLIP_NORM : tensor is already normalized with BiomedCLIP mean/std.
+    Exactly ONE pipeline stage owns normalization (Fix: Problems-#1):
+
+    RAW_UINT8       : tensor values are integers in [0, 255];
+                      model divides by 255 then applies BiomedCLIP mean/std.
+    RAW_FLOAT01     : tensor values are floats in [0.0, 1.0];
+                      model applies BiomedCLIP mean/std.
+    BIOMEDCLIP_NORM : tensor is ALREADY normalized with BiomedCLIP mean/std;
+                      model applies NO further normalization.
+                      This is the DEFAULT because the workspace data loaders
+                      (qml_models/dataset.py) emit already-normalized tensors.
     """
     RAW_UINT8       = "raw_uint8"
     RAW_FLOAT01     = "raw_float01"
     BIOMEDCLIP_NORM = "biomedclip_normalized"
 
 
+# BiomedCLIP open-ai CLIP normalization constants (must match qml_models/dataset.py)
+BIOMEDCLIP_MEAN = (0.48145466, 0.45782750, 0.40821073)
+BIOMEDCLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def _validate_image_batch(x: torch.Tensor, mode: Optional[ImagePreprocessMode] = None) -> None:
+    """Validate an image tensor against its declared preprocessing contract (Fix: Problems-#1).
+
+    Raises on non-finite values, wrong rank/dtype, and out-of-contract ranges.
+    """
+    if x.ndim != 4:
+        raise ValueError(
+            f"Problems-#1: expected rank-4 image batch (B, C, H, W), got shape {tuple(x.shape)}"
+        )
+    if not x.is_floating_point():
+        raise TypeError(
+            f"Problems-#1: expected floating-point image tensor, got dtype={x.dtype}. "
+            "Cast uint8 tensors explicitly before calling extract_features()."
+        )
+    if not torch.isfinite(x).all():
+        raise ValueError("Problems-#1: image batch contains non-finite (NaN/Inf) values.")
+    m = mode or ImagePreprocessMode.BIOMEDCLIP_NORM
+    if m == ImagePreprocessMode.RAW_UINT8:
+        if x.min().item() < 0.0 or x.max().item() > 255.0:
+            raise ValueError(
+                f"Problems-#1: RAW_UINT8 contract violated — values in "
+                f"[{x.min().item():.3f}, {x.max().item():.3f}], expected [0, 255]."
+            )
+    elif m == ImagePreprocessMode.RAW_FLOAT01:
+        if x.min().item() < 0.0 or x.max().item() > 1.0:
+            raise ValueError(
+                f"Problems-#1: RAW_FLOAT01 contract violated — values in "
+                f"[{x.min().item():.3f}, {x.max().item():.3f}], expected [0, 1]."
+            )
+    else:  # BIOMEDCLIP_NORM
+        # Channels should be roughly mean-0 / unit-var. A clearly unnormalized
+        # tensor (e.g. [0,1] floats or double-normalized inputs) is a pipeline bug.
+        if x.abs().max().item() <= 1.0001:
+            import warnings
+            warnings.warn(
+                "Problems-#1: BIOMEDCLIP_NORM contract expected but input range looks "
+                "unnormalized (|x| <= 1). Double-check the owner of normalization "
+                "in the data pipeline.",
+                stacklevel=3,
+            )
+        if x.abs().max().item() > 100.0:
+            raise ValueError(
+                f"Problems-#1: BIOMEDCLIP_NORM contract violated — |x|max="
+                f"{x.abs().max().item():.2f} is far outside normalized range "
+                "(double normalization suspected)."
+            )
+
+
 # ---------------------------------------------------------------------------
 # Checkpoint schema & feature cache helpers (Fix: H-06, L-07)
 # ---------------------------------------------------------------------------
-CHECKPOINT_SCHEMA_VERSION = "1.0"
+CHECKPOINT_SCHEMA_VERSION = "2.0"
+
+# Keys of `model` that define the predictive function; all must be identical on load.
+_PREDICTION_DEFINING_KEYS = (
+    "n_qubits", "n_layers", "n_classes", "diff_method",
+    "reupload", "p_drop", "dual_basis_only", "use_qaf_attention",
+    "clinical_hard", "q_init_std",
+)
 
 
-def save_feature_cache(features: torch.Tensor, path: Union[str, Path], encoder_id: str = "BiomedCLIP-v1") -> None:
-    """Save pre-extracted features with metadata sidecar for provenance validation (Fix: H-06)."""
+def _encoder_weight_fingerprint() -> str:
+    """Stable short fingerprint of the BiomedCLIP encoder loading config (Fix: Problems-#5).
+
+    Combines the encoder identity and the fine-tuning applicability so cached
+    features / checkpoints cannot silently transfer between encoder versions.
+    """
+    h = hashlib.sha256()
+    h.update(b"BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
+    h.update(str(_FINETUNING_AVAILABLE).encode())
+    return h.hexdigest()[:16]
+
+
+def save_feature_cache(
+    features: torch.Tensor,
+    path: Union[str, Path],
+    encoder_id: str = "BiomedCLIP-v1",
+    preprocess_mode: Optional[ImagePreprocessMode] = None,
+    sample_ids: Optional[List[str]] = None,
+) -> None:
+    """Save pre-extracted features with MANDATORY provenance metadata (Fix: H-06, Problems-#8).
+
+    The sidecar binds the cache to encoder identity, encoder weight fingerprint,
+    preprocessing contract, sample ordering, shape and dtype. Loaders refuse
+    caches without this metadata.
+    """
+    features = torch.as_tensor(features)
     p = Path(path)
     torch.save(features, str(p))
     meta_path = p.with_suffix(p.suffix + ".meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({
             "encoder_id": encoder_id,
-            "feature_dim": features.shape[-1],
-            "n_samples": features.shape[0],
+            "encoder_fingerprint": _encoder_weight_fingerprint(),
+            "preprocess_mode": str(preprocess_mode or ImagePreprocessMode.BIOMEDCLIP_NORM),
+            "feature_dim": int(features.shape[-1]),
+            "n_samples": int(features.shape[0]),
             "dtype": str(features.dtype),
+            "sample_ids_sha256": (
+                hashlib.sha256(json.dumps(sample_ids).encode()).hexdigest()[:16]
+                if sample_ids is not None else None
+            ),
+            "finite": bool(torch.isfinite(features).all().item()),
+            "schema_version": "2.0",
         }, f, indent=2)
 
 
-def load_feature_cache(path: Union[str, Path], expected_encoder_id: str = "BiomedCLIP-v1") -> torch.Tensor:
-    """Load pre-extracted features validating metadata sidecar when present (Fix: H-06)."""
+def load_feature_cache(
+    path: Union[str, Path],
+    expected_encoder_id: str = "BiomedCLIP-v1",
+    expected_feature_dim: Optional[int] = None,
+    expected_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Load pre-extracted features validating MANDATORY metadata & finiteness (Fix: Problems-#8).
+
+    Rejects metadata-free legacy caches, encoder/fingerprint mismatches, dim/dtype
+    mismatches, and non-finite features.
+    """
     p = Path(path)
     meta_path = p.with_suffix(p.suffix + ".meta.json")
-    if meta_path.exists():
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-        if meta.get("encoder_id") != expected_encoder_id:
-            raise ValueError(
-                f"H-06: Cache encoder '{meta.get('encoder_id')}' != expected '{expected_encoder_id}'."
-            )
-    return torch.load(str(p))
+    if not meta_path.exists():
+        raise ValueError(
+            f"Problems-#8: feature cache '{p.name}' has no provenance metadata sidecar "
+            f"({meta_path.name}). Caches without provenance cannot be verified as "
+            "compatible with the current encoder/preprocessing — re-extract features."
+        )
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    problems = []
+    if meta.get("encoder_id") != expected_encoder_id:
+        problems.append(
+            f"Cache encoder '{meta.get('encoder_id')}' != expected '{expected_encoder_id}'."
+        )
+    if meta.get("schema_version") != "2.0":
+        problems.append(f"Cache schema '{meta.get("schema_version")}' is not '2.0'.")
+    if meta.get("encoder_fingerprint") and meta["encoder_fingerprint"] != _encoder_weight_fingerprint():
+        problems.append(
+            f"Encoder weight fingerprint mismatch: cache={meta['encoder_fingerprint']}, "
+            f"current={_encoder_weight_fingerprint()}."
+        )
+    if meta.get("finite") is not True:
+        problems.append("Cache metadata records non-finite features.")
+    features = torch.load(str(p), map_location="cpu", weights_only=True)
+    if not torch.isfinite(features).all():
+        problems.append("Feature tensor contains NaN/Inf values.")
+    if expected_feature_dim is not None and features.shape[-1] != expected_feature_dim:
+        problems.append(
+            f"Feature dim {features.shape[-1]} != expected {expected_feature_dim}."
+        )
+    if expected_dtype is not None and features.dtype != expected_dtype:
+        problems.append(f"Feature dtype {features.dtype} != expected {expected_dtype}.")
+    if "n_samples" in meta and features.shape[0] != meta["n_samples"]:
+        problems.append(
+            f"Sample count mismatch: tensor={features.shape[0]}, meta={meta['n_samples']}."
+        )
+    if problems:
+        raise ValueError(
+            "Problems-#8: feature cache rejected — " + " | ".join(problems)
+        )
+    return features
 
 
 def save_model_checkpoint(
@@ -111,7 +251,8 @@ def save_model_checkpoint(
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra_metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Save model checkpoint with strict architectural schema metadata (Fix: L-07)."""
+    """Save model checkpoint with the FULL prediction-defining config (Fix: Problems-#5, L-07)."""
+    bb = getattr(model, "backbone", None)
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "architecture": {
@@ -121,15 +262,24 @@ def save_model_checkpoint(
             "diff_method": model.diff_method,
             "reupload": model.reupload,
             "p_drop": model.p_drop,
+            "q_init_std": model.q_init_std,
             "dual_basis_only": model.dual_basis_only,
             "use_qaf_attention": model.use_qaf_attention,
             "clinical_hard": model.clinical_hard,
+            # Structured genome identity (gate order matters for the same weights)
             "genome_repr": str(model.genome) if model.genome else None,
+            "genome_n_params": (
+                int(getattr(model.genome, "total_params", -1)) if model.genome else None
+            ),
         },
         "encoder_id": "BiomedCLIP-PubMedBERT_256-vit_base_patch16_224",
+        "encoder_fingerprint": _encoder_weight_fingerprint(),
         "feature_dim": 512,
         "pennylane_dev": getattr(model, "qdev_name", "unknown"),
-        "preprocess_mode": str(getattr(getattr(model, "backbone", None), "preprocess_mode", "raw_float01")),
+        # Preprocessing contract — part of the predictive function (Fix: Problems-#1/#5)
+        "preprocess_mode": str(getattr(bb, "preprocess_mode", ImagePreprocessMode.BIOMEDCLIP_NORM)),
+        # Class ordering contract
+        "class_order": list(range(model.n_classes)),
     }
     if extra_metadata:
         payload.update(extra_metadata)
@@ -141,22 +291,77 @@ def save_model_checkpoint(
     logger.info("L-07: Saved versioned checkpoint to %s (schema v%s)", path, CHECKPOINT_SCHEMA_VERSION)
 
 
-def load_model_checkpoint(path: Union[str, Path], model: "HybridCNNVQC", strict: bool = True) -> Dict[str, Any]:
-    """Load model checkpoint and enforce schema & architecture compatibility (Fix: L-07)."""
-    ckpt = torch.load(str(path), map_location="cpu")
+def load_model_checkpoint(
+    path: Union[str, Path],
+    model: "HybridCNNVQC",
+    strict: bool = True,
+    allow_config_mismatch: bool = False,
+) -> Dict[str, Any]:
+    """Load model checkpoint enforcing FULL prediction-equivalent config (Fix: Problems-#5).
+
+    Every prediction-defining field must match: architecture, reupload/clinical_hard,
+    p_drop, q_init_std, preprocessing contract, genome structure, encoder identity
+    fingerprint, and class ordering. A mismatch raises ValueError unless
+    ``allow_config_mismatch=True`` is explicitly passed (and then only with a warning).
+    """
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=True)
     meta = ckpt.get("metadata", {})
     if meta.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
-            f"L-07: Checkpoint schema '{meta.get('schema_version')}' != current '{CHECKPOINT_SCHEMA_VERSION}'."
+            f"L-07/Problems-#5: Checkpoint schema '{meta.get('schema_version')}' != current "
+            f"'{CHECKPOINT_SCHEMA_VERSION}'. Silently loading weights across schema "
+            "versions changes the predictive function."
         )
     arch = meta.get("architecture", {})
     mismatches = [
         f"{k}: ckpt={arch.get(k)}, model={getattr(model, k, None)}"
-        for k in ("n_qubits", "n_layers", "n_classes", "dual_basis_only", "use_qaf_attention")
-        if k in arch and arch.get(k) != getattr(model, k, None)
+        for k in _PREDICTION_DEFINING_KEYS
+        if arch.get(k) is not None and arch.get(k) != getattr(model, k, None)
     ]
+
+    # Missing mandatory metadata must not pass compatibility checks (Fix: Problems-#5)
+    missing = [
+        k for k in ("schema_version", "architecture", "preprocess_mode", "encoder_id")
+        if k not in meta or meta.get(k) is None
+    ]
+    if missing:
+        raise ValueError(f"Problems-#5: checkpoint metadata missing mandatory keys: {missing}")
+
+    # Genome structural identity
+    ckpt_genome = arch.get("genome_repr")
+    model_genome = str(model.genome) if model.genome else None
+    if ckpt_genome != model_genome:
+        mismatches.append(f"genome: ckpt={ckpt_genome}, model={model_genome}")
+
+    # Preprocessing contract identity
+    ckpt_pm = meta.get("preprocess_mode")
+    model_pm = str(getattr(getattr(model, "backbone", None), "preprocess_mode", ImagePreprocessMode.BIOMEDCLIP_NORM))
+    if ckpt_pm != model_pm:
+        mismatches.append(f"preprocess_mode: ckpt={ckpt_pm}, model={model_pm}")
+
+    # Encoder identity + weight-config fingerprint
+    if meta.get("encoder_fingerprint") and meta["encoder_fingerprint"] != _encoder_weight_fingerprint():
+        mismatches.append(
+            f"encoder_fingerprint: ckpt={meta['encoder_fingerprint']}, "
+            f"model={_encoder_weight_fingerprint()}"
+        )
+
+    # Class ordering
+    if "class_order" in meta and meta["class_order"] != list(range(model.n_classes)):
+        mismatches.append(f"class_order: ckpt={meta['class_order']}, model=identity")
+
+    # The projection head itself must carry the same clinical_hard mode as the
+    # saved function (a silent projection-mode change alters the encoding).
+    bb_proj_hard = getattr(getattr(getattr(model, "backbone", None), "riemannian_head", None), "clinical_hard", None)
+    if arch.get("clinical_hard") is not None and bb_proj_hard is not None and bb_proj_hard != arch["clinical_hard"]:
+        mismatches.append(f"riemannian_head.clinical_hard: ckpt={arch['clinical_hard']}, model={bb_proj_hard}")
+
     if mismatches:
-        raise ValueError(f"L-07: Architecture mismatch — {'; '.join(mismatches)}")
+        msg = f"Problems-#5: checkpoint/config mismatch — {'; '.join(mismatches)}"
+        if not allow_config_mismatch:
+            raise ValueError(msg)
+        logger.warning("%s (explicitly allowed by caller)", msg)
+
     model.load_state_dict(ckpt["state_dict"], strict=strict)
     return ckpt
 
@@ -369,20 +574,40 @@ class RiemannianBlochProjection(nn.Module):
     r"""Projects unconstrained 3-D Cartesian logits per qubit onto the unit 2-sphere S^2.
 
     Eliminates tanh saturation plateaus, vanishing gradients, and coordinate fold singularities.
-    Converts Cartesian unit vectors r = (rx, ry, rz) \in S^2 into canonical spherical angles:
-        θ = atan2(sqrt(rx^2+ry^2), rz) ∈ [0, π]   (polar colatitude from |0⟩ to |1⟩, smooth gradient)
+    Converts Cartesian unit vectors r = (rx, ry, rz) \u2208 S^2 into canonical spherical angles:
+        θ = atan2(sqrt(rx^2+ry^2), rz) ∈ [0, π]   (polar colatitude, smooth everywhere, Fix: H-02)
         φ = atan2(ry, rx)              ∈ [-π, π]  (azimuthal equatorial longitude)
-        λ = atan2(rz, ry)              ∈ [-π, π]  (independent third rotational coordinate, Fix: H-01)
+        λ ≡ 0                          (Fix: H-01, Problems-#3)
 
-    When clinical_hard=True:
-        θ ∈ [0.05·π, 0.95·π]
-        φ ∈ [-0.95·π, 0.95·π]
-        λ ∈ [-0.95·π, 0.95·π]
+    Fix (Problems-#3 — discontinuous λ): the previous third angle
+    λ = atan2(rz, ry) is a singular coordinate chart (it diverges near the ±X
+    directions where both ry, rz → 0, so two almost-identical inputs can encode
+    to nearly orthogonal states). The projection is a PURE-STATE preparation:
+    a Bloch direction has exactly two degrees of freedom, so the U3 encoding
+    U3(θ, φ, 0) = RZ(φ+0) · RY(θ) prepares |R(θ, φ) |0⟩ with no third
+    independent coordinate. λ is therefore FIXED to 0 (the latent keeps the same
+    (B, 3*n_qubits) layout for checkpoint/algorithm compatibility, with the
+    third slot constant). State continuity is guaranteed: θ and φ are smooth on
+    S^2 except at the negative-pole azimuth chart, which is handled by the
+    identical-limit behavior of atan2 at the branch cut (the prepared STATES at
+    ±π differ only by a global phase, so any physical observable is identical).
+
+    When clinical_hard=True (Fix: Problems-#4 — periodicity-preserving):
+        θ' = 0.90·θ + 0.05π ∈ [0.05π, 0.95π]        (not periodic: safe to scale)
+        φ' = φ - κ·sin(φ), κ = 0.2                       (smooth, odd, periodic —
+                                                          ±π remain equivalent; no
+                                                          φ·0.95 branch-cut discontinuity)
     """
-    def __init__(self, eps: float = 1e-6, clinical_hard: bool = False):
+    def __init__(self, eps: float = 1e-6, clinical_hard: bool = False, azimuth_compression: float = 0.2):
         super().__init__()
         self.eps = eps
         self.clinical_hard = clinical_hard
+        # Problems-#4: periodicity-preserving azimuth compression strength κ ∈ [0, 1)
+        if not (0.0 <= azimuth_compression < 1.0):
+            raise ValueError(
+                f"Problems-#4: azimuth_compression κ must be in [0, 1), got {azimuth_compression}"
+            )
+        self.azimuth_compression = azimuth_compression
 
     def forward(self, raw: torch.Tensor, n_qubits: int) -> Tuple[torch.Tensor, torch.Tensor]:
         # raw: (B, 3 * n_qubits) -> validate shape and reshape (Fix: M-08)
@@ -410,14 +635,22 @@ class RiemannianBlochProjection(nn.Module):
         theta = torch.atan2(rxy_norm, rz)                # [0, pi], smooth gradient everywhere
         phi   = torch.atan2(ry, rx)                      # [-pi, pi]
 
-        # Independent third coordinate in rz-ry plane (Fix: H-01)
-        lam   = torch.atan2(rz.clamp(-1.0 + self.eps, 1.0 - self.eps), ry)  # [-pi, pi]
+        # Fix: Problems-#3 — the third U3 angle is FIXED to 0 (pure-state
+        # preparation has only two degrees of freedom; deriving it from a
+        # singular atan2(rz, ry) chart created encoding discontinuities).
+        lam = torch.zeros_like(theta)
 
         if self.clinical_hard:
             # Smooth polar expansion allowing both Northern and Southern hemispheres (Task 3.5, C-03)
             theta = theta * 0.90 + 0.05 * math.pi        # [0.05*pi, 0.95*pi] differentiable polar range
-            phi   = phi * 0.95                           # [-0.95*pi, 0.95*pi]
-            lam   = lam * 0.95                           # [-0.95*pi, 0.95*pi]
+            # Fix: Problems-#4 — periodicity-preserving azimuth compression.
+            # Old code scaled phi and lam by 0.95, mapping ±pi to ±0.95pi and
+            # breaking the ±pi equivalence (branch-cut discontinuity ~0.156).
+            # phi - kappa*sin(phi) is smooth, odd, 2pi-periodic, monotone on
+            # [-pi, pi] (for kappa < 1), and maps ±pi → ±pi exactly.
+            kappa = self.azimuth_compression
+            phi = phi - kappa * torch.sin(phi)           # periodic-shrunk toward equator
+            # lam is identically 0 — compression is a no-op for it.
 
         z = torch.cat([theta, phi, lam], dim=-1)         # (B, 3 * n_qubits)
         return z, r
@@ -461,7 +694,10 @@ class BiomedCLIPQuantumBackbone(nn.Module):
         self.backbone_unfreeze_layers = backbone_unfreeze_layers
         self.dataset_name = dataset_name
         self.enable_finetuning = enable_finetuning
-        self.preprocess_mode = preprocess_mode or ImagePreprocessMode.RAW_FLOAT01  # (Fix: H-04)
+        # Fix: Problems-#1 — default to BIOMEDCLIP_NORM because the workspace data
+        # loaders (qml_models/dataset.py) already apply BiomedCLIP normalization;
+        # the old RAW_FLOAT01 default double-normalized every input.
+        self.preprocess_mode = preprocess_mode or ImagePreprocessMode.BIOMEDCLIP_NORM  # (Fix: H-04)
         self.feature_only_mode = feature_only_mode  # (Fix: M-02)
 
         # Lazy loading of vision encoder (Fix: M-02, L-04)
@@ -529,8 +765,15 @@ class BiomedCLIPQuantumBackbone(nn.Module):
                     for p in resblocks[i].parameters():
                         p.requires_grad = True
 
-    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Offline pass helper: returns 512-d feature vectors with explicit normalization (Fix: H-04, H-05, H-14, M-15)."""
+    def extract_features(self, x: torch.Tensor, needs_input_grad: bool = False) -> torch.Tensor:
+        """Offline pass helper: returns 512-d feature vectors with explicit normalization (Fix: H-04, H-05, H-14, M-15).
+
+        needs_input_grad=True (Fix: Problems-#10): keeps gradients flowing to the
+        INPUT image — the encoder's weights stay frozen via requires_grad=False,
+        so freezing parameters does not require blocking input gradients. Enable
+        for input-gradient attribution / saliency; the default False preserves
+        the memory-efficient inference path.
+        """
         if self.vision_encoder is None:
             raise RuntimeError(
                 "H-14: Vision encoder has been offloaded or initialized in feature_only_mode. "
@@ -543,7 +786,7 @@ class BiomedCLIPQuantumBackbone(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(0)
 
-        # Strict channel validation (Fix: H-05)
+        # Strict channel validation (Fix: H-05, Problems-#1 validation)
         declared_ch = getattr(self, "_in_channels", None)
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
@@ -564,16 +807,15 @@ class BiomedCLIPQuantumBackbone(nn.Module):
         if x.shape[-2:] != (224, 224):
             x = F.interpolate(x, size=(224, 224), mode="bilinear", align_corners=False)
 
-        # Deterministic preprocessing mode (Fix: H-04)
-        mode = getattr(self, "preprocess_mode", ImagePreprocessMode.RAW_FLOAT01)
+        # Deterministic preprocessing mode (Fix: H-04; Problems-#1 single owner)
+        mode = getattr(self, "preprocess_mode", ImagePreprocessMode.BIOMEDCLIP_NORM)
+        _validate_image_batch(x, mode)
         if mode != ImagePreprocessMode.BIOMEDCLIP_NORM:
             if mode == ImagePreprocessMode.RAW_UINT8:
                 x = x / 255.0
-            mean = torch.tensor(
-                [0.48145466, 0.45782750, 0.40821073], device=x.device, dtype=x.dtype
+            mean = torch.tensor(BIOMEDCLIP_MEAN, device=x.device, dtype=x.dtype
             ).view(1, 3, 1, 1)
-            std = torch.tensor(
-                [0.26862954, 0.26130258, 0.27577711], device=x.device, dtype=x.dtype
+            std = torch.tensor(BIOMEDCLIP_STD, device=x.device, dtype=x.dtype
             ).view(1, 3, 1, 1)
             x = (x - mean) / std
 
@@ -584,7 +826,13 @@ class BiomedCLIPQuantumBackbone(nn.Module):
         else:
             self.vision_encoder.eval()
 
-        grad_context = torch.enable_grad if is_fine_tuning else torch.no_grad
+        # Problems-#10: attribution path — do not disable input gradients when
+        # the caller requests them (encoder weights remain frozen independently).
+        grad_context = (
+            torch.enable_grad
+            if (is_fine_tuning or needs_input_grad)
+            else torch.no_grad
+        )
         with grad_context():
             if x.is_cuda and torch.cuda.is_bf16_supported():
                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -712,14 +960,22 @@ class BiomedCLIPQuantumBackbone(nn.Module):
 # ---------------------------------------------------------------------------
 class QuantumDropout(nn.Module):
     """
-    Stochastic Angle Dropout & Phase-Symmetric Jitter (Q-Dropout — Fix: M-05):
-    - When use_phase_jitter=True: applies bounded zero-mean Gaussian phase jitter during training:
-      theta_tilde = theta + delta, delta ~ N(0, jitter_std^2)
-      Preserves expected unitary geometric structure without collapsing gates to Identity.
-    - When use_phase_jitter=False: deactivates rotation angles with probability p_drop,
-      rescaling active angles by 1 / (1 - p_drop) (standard inverted dropout).
+    Stochastic Angle Dropout & Phase-Symmetric Jitter (Q-Dropout — Fix: M-05;
+    noise semantics — Fix: Problems-#7):
+
+    - When use_phase_jitter=True: applies bounded zero-mean Gaussian phase jitter
+      during training whose STRENGTH is controlled by p_drop —
+        theta_tilde = theta + delta, delta ~ N(0, (p_drop * jitter_std)^2)
+        delta is clamped to ±3·jitter_std (bounded, unlike the old unbounded noise).
+      p_drop = 0 disables noise entirely; p_drop = 1 uses the full jitter_std.
+      (The old semantics ignored p_drop's magnitude: 0.01, 0.1, and 1.0 produced
+      IDENTICAL noise, so tuning "p_drop" wasn't tuning anything.)
+    - When use_phase_jitter=False: deactivates rotation angles with probability
+      p_drop without rescaling (scaling angles breaks the S^1 phase topology).
     During evaluation: leaves angles untouched.
     """
+    MAX_JITTER_SIGMAS = 3.0  # clamp bound; keeps phases within ±3·jitter_std
+
     def __init__(self, p_drop: float = 0.10, use_phase_jitter: bool = True, jitter_std: float = 0.05):
         super().__init__()
         if not (0.0 <= p_drop <= 1.0):
@@ -734,7 +990,13 @@ class QuantumDropout(nn.Module):
         if not self.training or self.p_drop <= 0.0:
             return weights
         if self.use_phase_jitter:
-            return weights + torch.randn_like(weights) * self.jitter_std
+            # Problems-#7: noise STRENGTH scales with p_drop; bound to ±3σ_base
+            effective_std = self.p_drop * self.jitter_std
+            delta = torch.randn_like(weights) * effective_std
+            return weights + delta.clamp(
+                -self.MAX_JITTER_SIGMAS * self.jitter_std,
+                 self.MAX_JITTER_SIGMAS * self.jitter_std,
+            )
         else:
             # Stochastic angle deactivation without inverted-dropout rescaling
             # Scaling angles breaks the S^1 topology, causing phase-inversion.
@@ -756,9 +1018,10 @@ class QuantumDropoutTorchLayer(qml.qnn.TorchLayer):
         init_method=None,
         p_drop: float = 0.10,
         transfers_to_cpu: bool = False,
+        jitter_std: float = 0.05,
     ):
         super().__init__(qnode, weight_shapes, init_method=init_method)
-        self.q_dropout = QuantumDropout(p_drop=p_drop)
+        self.q_dropout = QuantumDropout(p_drop=p_drop, jitter_std=jitter_std)
         self._transfers_to_cpu = transfers_to_cpu  # Configured explicitly (Fix: H-07)
 
     def _evaluate_qnode(self, x):
@@ -1033,6 +1296,7 @@ class HybridCNNVQC(nn.Module):
         backbone: Optional[BiomedCLIPQuantumBackbone] = None,
         preprocess_mode: Optional[ImagePreprocessMode] = None,
         feature_only_mode: bool = False,
+        jitter_std: float = 0.05,
     ):
         super().__init__()
         self._validate_constructor_args(n_qubits, n_layers, n_classes, dropout, p_drop, q_init_std)
@@ -1043,6 +1307,7 @@ class HybridCNNVQC(nn.Module):
         self.diff_method = diff_method
         self.reupload    = reupload
         self.p_drop      = p_drop
+        self.jitter_std  = jitter_std
         self.genome      = genome
         self.q_init_std  = q_init_std
         self.qdevice     = qdevice
@@ -1067,6 +1332,7 @@ class HybridCNNVQC(nn.Module):
         # Classical feature extractor + residual adapter (Fix: M-03 shared backbone)
         if backbone is not None:
             self.backbone = backbone
+            self._owns_full_backbone = False
         else:
             self.backbone = BiomedCLIPQuantumBackbone(
                 in_channels=in_channels,
@@ -1077,6 +1343,7 @@ class HybridCNNVQC(nn.Module):
                 preprocess_mode=preprocess_mode,
                 feature_only_mode=feature_only_mode,
             )
+            self._owns_full_backbone = True
 
         # Quantum layer (supports dynamic QNAS genome or static StronglyEntanglingLayers)
         qnode, weight_shapes, self.qdev, self.qdev_name, self.n_meas = create_vqc_qnode(
@@ -1096,6 +1363,7 @@ class HybridCNNVQC(nn.Module):
         self.qlayer = QuantumDropoutTorchLayer(
             qnode, weight_shapes, init_method=init_method, p_drop=p_drop,
             transfers_to_cpu=transfers_to_cpu,
+            jitter_std=jitter_std,
         )
 
         # SuperCircuit Weight Inheritance: Size mismatch raises ValueError (Fix: M-12)
@@ -1127,7 +1395,17 @@ class HybridCNNVQC(nn.Module):
             nn.Linear(32, n_classes),
         )
         if isinstance(self.head[-1], nn.Linear):
-            nn.init.normal_(self.head[-1].weight, mean=0.0, std=0.01)
+            # Problems-#9: deterministic, seed-INDEPENDENT identical final-layer
+            # init for hybrid AND baseline: same fan-in-averaged scale, drawn from
+            # a dedicated local generator so neither model's head depends on the
+            # other's RNG consumption order.
+            g = torch.Generator(device="cpu")
+            g.manual_seed(20240218)  # fixed init seed shared by both model classes
+            with torch.no_grad():
+                self.head[-1].weight.copy_(torch.randn(
+                    self.head[-1].weight.shape, generator=g, dtype=torch.float32,
+                ))
+            self.head[-1].weight.data.mul_(0.01)  # target std ~= 0.01 per-fan-in neutral
             if self.head[-1].bias is not None:
                 nn.init.zeros_(self.head[-1].bias)
 
@@ -1307,7 +1585,14 @@ class HybridCNNVQC(nn.Module):
         param_device = next(self.parameters()).device
         new_qlayer = new_qlayer.to(param_device)
 
-        # 4. Copy trained weights and calculate exact freeze boundary (Fix: C-02)
+        # 5. Inherits parent module training mode (Fix: Problems-#6C)
+        #    Zero-variational ROY gates + data-dependent U3 + entanglers mean a
+        #    near-zero initialized extension is NOT identity, so a newly attached
+        #    layer must not silently stay in training mode while the model is
+        #    evaluating (would make inference stochastically noisy).
+        new_qlayer.train(self.training)
+
+        # 6. Copy trained weights and calculate exact freeze boundary (Fix: C-02)
         freeze_len = 0
         is_flat = False
         with torch.no_grad():
@@ -1396,32 +1681,72 @@ class HybridCNNVQC(nn.Module):
         if hasattr(self, "_state_qnode_cache"):
             self._state_qnode_cache.clear()
 
-        # 6. Rebuild optimizer param-groups & flush momentum (Fix: C-01)
+        # 7. Rebuild optimizer param-groups & flush momentum (Fix: C-01, Problems-#6A)
         if optimizer is not None:
+            # Use optimizer defaults to render COMPLETE hyperparameter dicts (Problems-#6A:
+            # the old rebuild produced {params, lr}-only groups, so AdamW's step crashed
+            # with KeyError: 'betas')
+            defaults = dict(getattr(optimizer, "defaults", {}))
+            old_qlayer_param_ids = {id(p) for p in old_qlayer.parameters()}
             model_param_ids = {id(p) for p in self.parameters()}
 
             new_param_groups = []
             for group in optimizer.param_groups:
                 live_params = [p for p in group["params"] if id(p) in model_param_ids]
                 new_group = {k: v for k, v in group.items() if k != "params"}
+                for dk, dv in defaults.items():
+                    new_group.setdefault(dk, dv)
                 new_group["params"] = live_params
                 new_param_groups.append(new_group)
 
-            # Add new qlayer params as a fresh group inheriting base lr
-            base_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 1e-3
-            new_param_groups.append({
+            # Add new qlayer params as a fresh group preserving the replaced quantum
+            # group's lr (old code installed the FIRST group's lr — typically the
+            # 1e-5 backbone rate — on quantum params)
+            old_quantum_lrs = [
+                g["lr"] for g in optimizer.param_groups
+                if g.get("params") and any(id(p) in old_qlayer_param_ids for p in g["params"])
+            ]
+            quantum_lr = old_quantum_lrs[0] if old_quantum_lrs else (
+                optimizer.param_groups[0]["lr"] if optimizer.param_groups else 1e-3
+            )
+            quantum_group = dict(defaults)
+            quantum_group.update({
                 "params": list(self.qlayer.parameters()),
-                "lr": base_lr,
+                "lr": quantum_lr,
             })
+            new_param_groups.append(quantum_group)
 
             # Flush momentum buffers only for replaced quantum parameters (FLAW-MOD-04)
-            if freeze_previous and old_qlayer is not None:
-                old_qlayer_param_ids = {id(p) for p in old_qlayer.parameters()}
-                for p in list(optimizer.state.keys()):
-                    if id(p) in old_qlayer_param_ids:
-                        del optimizer.state[p]
+            for p in list(optimizer.state.keys()):
+                if id(p) in old_qlayer_param_ids:
+                    del optimizer.state[p]
 
             optimizer.param_groups = new_param_groups
+
+            # Problems-#6B: enforce the freeze at parameter-update level (gradient
+            # masking alone cannot stop weight decay / momentum from mutating the
+            # frozen prefix). Wrap optimizer.step to zero frozen grads pre-update.
+            if freeze_previous and freeze_len > 0:
+                frozen_param = None
+                for n, p in self.qlayer.named_parameters():
+                    if "weights" in n:
+                        frozen_param = p
+                        break
+                if frozen_param is not None and callable(getattr(optimizer, "step", None)):
+                    _n_frozen, _flat = freeze_len, is_flat
+                    _orig_step = optimizer.step
+
+                    def _freeze_guard_step(closure=None):
+                        if frozen_param.grad is not None:
+                            g = frozen_param.grad
+                            if _flat:
+                                g.view(-1)[:_n_frozen] = 0.0
+                            else:
+                                g[:_n_frozen] = 0.0
+                        return _orig_step(closure)
+
+                    optimizer.step = _freeze_guard_step
+                    self._freeze_step_guard = (frozen_param, _orig_step)
 
             # Assert C-01 invariant: every trainable parameter is registered in the optimizer
             opt_param_ids = {id(p) for g in optimizer.param_groups for p in g["params"]}
@@ -1558,9 +1883,10 @@ class ClassicalBaseline(nn.Module):
         self.genome = genome
         self.use_qaf_attention = use_qaf_attention
 
-        # Same backbone (shares BiomedCLIP + residual adapter, Fix: M-03)
+        # Same backbone (BiomedCLIP + residual adapter; may share the frozen encoder, Fix: M-03)
         if backbone is not None:
             self.backbone = backbone
+            self._owns_full_backbone = False
         else:
             self.backbone = BiomedCLIPQuantumBackbone(
                 in_channels=in_channels,
@@ -1571,6 +1897,7 @@ class ClassicalBaseline(nn.Module):
                 preprocess_mode=preprocess_mode,
                 feature_only_mode=feature_only_mode,
             )
+            self._owns_full_backbone = True
 
         # Compute quantum parameter count to match (Fix: H-10, H-11)
         if use_qaf_attention:
@@ -1626,6 +1953,19 @@ class ClassicalBaseline(nn.Module):
             nn.Dropout(p=dropout),
             nn.Linear(32, n_classes),
         )
+
+        # Problems-#9: IDENTICAL head initialization procedure to HybridCNNVQC —
+        # deterministic, seed-independent (dedicated fixed-seed generator).
+        if isinstance(self.head[-1], nn.Linear):
+            g = torch.Generator(device="cpu")
+            g.manual_seed(20240218)
+            with torch.no_grad():
+                self.head[-1].weight.copy_(torch.randn(
+                    self.head[-1].weight.shape, generator=g, dtype=torch.float32,
+                ))
+            self.head[-1].weight.data.mul_(0.01)
+            if self.head[-1].bias is not None:
+                nn.init.zeros_(self.head[-1].bias)
 
         # Hook for latent
         self._latent_z: Optional[torch.Tensor] = None
@@ -1710,16 +2050,20 @@ def build_models(
     preprocess_mode: Optional[ImagePreprocessMode] = None,
     feature_only_mode: bool = False,
     shared_backbone: bool = True,
+    jitter_std: float = 0.05,
 ) -> Tuple[HybridCNNVQC, ClassicalBaseline]:
     """Instantiate both hybrid and classical baseline models, moving to device (Fix: M-03, H-10, L-03).
 
-    When shared_backbone=True, a single BiomedCLIPQuantumBackbone instance is shared
-    between the hybrid model and classical baseline.
+    When shared_backbone=True, the frozen BiomedCLIP vision encoder is shared between the
+    hybrid model and classical baseline, but each model receives its OWN trainable
+    CQ adapter + residual skip (deep-copied to identical initial weights for a fair
+    comparison). The old sharing of the entire backbone made the two models
+    interfere: baseline optimization mutated the hybrid representation (Fix: Problems-#2).
     """
     if device is None:
         device = get_torch_device()
 
-    # Create shared backbone when requested (Fix: M-03)
+    # Create the anchor backbone when requested (Fix: Problems-#2)
     backbone_inst = None
     if shared_backbone:
         backbone_inst = BiomedCLIPQuantumBackbone(
@@ -1743,6 +2087,7 @@ def build_models(
         backbone=backbone_inst,
         preprocess_mode=preprocess_mode,
         feature_only_mode=feature_only_mode,
+        jitter_std=jitter_std,
     ).to(device)
 
     # Apply finetuned BiomedCLIP ViT weights if available
@@ -1770,8 +2115,50 @@ def build_models(
         feature_only_mode=feature_only_mode,
     ).to(device)
 
+    # Fix: Problems-#2 — the baseline must NOT share the hybrid's trainable adapter.
+    # Copy the anchor backbone's weights into a fresh backbone (IDENTICAL initial
+    # weights, frozen vision encoder shared only via its Parameters since it is
+    # frozen) so both models start from exactly the same representation but
+    # optimize independently. (We rebuild + state_dict-copy instead of
+    # copy.deepcopy: nn.Module.__deepcopy__ keeps parameter *tensor* references
+    # and shared mutable attribute objects, which silently re-couples optimization.)
+    if shared_backbone and backbone_inst is not None:
+        baseline_backbone = BiomedCLIPQuantumBackbone(
+            in_channels=in_channels,
+            n_qubits=n_qubits,
+            dropout=dropout,
+            use_lora=use_lora,
+            clinical_hard=clinical_hard,
+            preprocess_mode=preprocess_mode,
+            feature_only_mode=feature_only_mode,
+        ).to(device)
+        with torch.no_grad():
+            baseline_backbone.load_state_dict(backbone_inst.state_dict(), strict=False)
+        if feature_only_mode or backbone_inst.vision_encoder is None:
+            baseline_backbone.vision_encoder = backbone_inst.vision_encoder
+        baseline.backbone = baseline_backbone
+        baseline._owns_full_backbone = True
+    # Also mirror finetuned ViT weights if they were just applied to the hybrid
+    if shared_backbone and backbone_inst is not None and finetune_backbone and ft_dataset_name and _FINETUNING_AVAILABLE:
+        with torch.no_grad():
+            if hybrid.backbone.vision_encoder is not None and baseline_backbone.vision_encoder is not None:
+                baseline_backbone.vision_encoder.load_state_dict(hybrid.backbone.vision_encoder.state_dict())
+
     logger.info("Hybrid   trainable params : %d", hybrid.count_parameters()["total"])
     logger.info("Baseline trainable params: %d", baseline.count_parameters()["total"])
+    # Problems-#9: honest parameter-match accounting — the baseline MLP only
+    # approximately matches the quantum trainable-parameter count (integer
+    # grid search finds the CLOSEST width). Do not claim exact matching.
+    h_q = hybrid.count_parameters()
+    b_c = baseline.count_parameters()
+    h_q_vp = h_q["quantum"]
+    b_mlp = b_c["mlp"]
+    logger.info(
+        "Problems-#9 baseline matching: quantum_trainable=%d vs baseline_mlp=%d "
+        "(delta=%d, approximately matched — NOT exactly; extras: extra GELU+dropout "
+        "layers and different init for hidden layer)",
+        h_q_vp, b_mlp, abs(b_mlp - h_q_vp),
+    )
     logger.info("PennyLane dev  : %s", hybrid.qdev_name)
     logger.info("PyTorch dev    : %s", device)
     logger.info("n_meas (local observables): %d", hybrid.n_meas)
@@ -1836,10 +2223,12 @@ if __name__ == "__main__":
         f"clinical_hard theta below 0.05*pi: {theta_hard.min():.4f}"
     assert theta_hard.max() <= 0.95 * math.pi + 1e-4, \
         f"clinical_hard theta above 0.95*pi: {theta_hard.max():.4f}"
-    assert phi_hard.abs().max() <= 0.95 * math.pi + 1e-4, \
-        f"clinical_hard phi out of [-0.95*pi, 0.95*pi]: {phi_hard.abs().max():.4f}"
-    assert lam_hard.abs().max() <= 0.95 * math.pi + 1e-4, \
-        f"clinical_hard lam out of [-0.95*pi, 0.95*pi]: {lam_hard.abs().max():.4f}"
+    # Problems-#4: azimuthal compression is periodicity-preserving: phi stays in
+    # [-pi, pi] with ±pi EXACTLY equivalent (the old phi*0.95 bound is obsolete).
+    assert phi_hard.abs().max() <= math.pi + 1e-4, \
+        f"clinical_hard phi out of [-pi, pi]: {phi_hard.abs().max():.4f}"
+    assert lam_hard.abs().max() <= 1e-7, \
+        f"clinical_hard lam must be identically zero (pure-state prep): {lam_hard.abs().max():.4f}"
     logger.info(
         "clinical_hard range — theta: [%.4f, %.4f] phi: [%.4f, %.4f] lam: [%.4f, %.4f]",
         theta_hard.min(), theta_hard.max(),

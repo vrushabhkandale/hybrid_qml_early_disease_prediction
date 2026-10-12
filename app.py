@@ -31,6 +31,7 @@ import signal
 import time
 import re
 import gc
+import hmac
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
 
@@ -50,6 +51,10 @@ from torchvision import transforms
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset import DATASET_CONFIG
+try:
+    from calibration import mondrian_prediction_set, predict_with_cost_matrix
+except ImportError:
+    from qml_models.calibration import mondrian_prediction_set, predict_with_cost_matrix
 
 try:
     from finetuning import has_finetuned_checkpoint, get_finetuned_checkpoint_path
@@ -192,9 +197,10 @@ def get_checkpoint_metadata(dataset_name: str) -> Optional[Dict]:
                     }
                 return {
                     "config": cfg,
-                    "meta": summary.get("meta", {}),
-                    "hybrid_metrics": summary.get("hybrid_metrics", {}),
-                    "baseline_metrics": summary.get("baseline_metrics", {}),
+                    "meta": summary.get("meta", summary.get("hybrid_meta", {})),
+                    "hybrid_metrics": summary.get("hybrid_metrics", summary.get("hybrid", {})),
+                    "baseline_metrics": summary.get("baseline_metrics", summary.get("baseline", {})),
+                    "calibration": summary.get("calibration", {}),
                 }
         except Exception:
             pass
@@ -202,7 +208,7 @@ def get_checkpoint_metadata(dataset_name: str) -> Optional[Dict]:
     ckpt_path = os.path.join(out_dir, "checkpoints", "hybrid_model.pt")
     if os.path.exists(ckpt_path):
         try:
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
             return {
                 "config": ckpt.get("config", {}),
                 "meta": ckpt.get("meta", {}),
@@ -327,13 +333,42 @@ def get_compiled_npu_vision_encoder(_model_ref, target_device: str = "NPU"):
     return compiled, chosen_dev
 
 
+def _restore_calibration_artifacts(model, checkpoint: Dict, device: torch.device, n_classes: int) -> None:
+    """Attach checkpoint-owned calibration artifacts to a loaded model."""
+    from calibration import QuantumBetaCalibrator, QuantumMultiClassCalibrator
+
+    calibration = checkpoint.get("calibration") or {}
+    meta = checkpoint.get("meta") or {}
+    cal_type = checkpoint.get("calibrator_type") or calibration.get("calibrator_type")
+    cal_state = checkpoint.get("calibrator_state_dict")
+    if cal_state:
+        if cal_type == "beta":
+            calibrator = QuantumBetaCalibrator()
+        elif cal_type in ("multiclass", "dirichlet"):
+            calibrator = QuantumMultiClassCalibrator(n_classes=n_classes)
+        else:
+            raise ValueError(f"Unknown checkpoint calibrator_type={cal_type!r}")
+        calibrator.load_state_dict(cal_state, strict=True)
+        model._calibrator = calibrator.to(device).eval()
+
+    model._calibration_temperature = float(
+        meta.get("temperature", calibration.get("temperature", 1.0))
+    )
+    model._decision_threshold = meta.get("threshold", calibration.get("threshold", 0.5))
+    model._decision_policy = checkpoint.get("config", {}).get(
+        "decision_policy", {"type": "argmax", "cost_matrix": None}
+    )
+    conformal = checkpoint.get("conformal_scores", calibration.get("conformal_scores", {}))
+    model._conformal_scores = conformal if isinstance(conformal, dict) else np.asarray(conformal, dtype=np.float32)
+
+
 
 @st.cache_resource(show_spinner=False)
 def load_hybrid_model(checkpoint_path: str, _device: torch.device, dual_basis_readout: Optional[bool] = None):
     """Load trained hybrid model on-demand with accurate architecture flags and selectable readout mode."""
     from model import HybridCNNVQC
 
-    ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=True)
     config = ckpt.get("config", {})
     meta = ckpt.get("meta", {})
     sd = ckpt["model_state_dict"]
@@ -347,25 +382,29 @@ def load_hybrid_model(checkpoint_path: str, _device: torch.device, dual_basis_re
     if qnas_genome_dict is not None:
         try:
             from qnas import CircuitGenome
-            genome = CircuitGenome.from_dict(qnas_genome_dict)
-        except Exception:
+        except ImportError:
             try:
                 from qml_models.qnas import CircuitGenome
-                genome = CircuitGenome.from_dict(qnas_genome_dict)
-            except Exception:
-                pass
+            except ImportError as exc:
+                raise RuntimeError("QNAS genome is present but qnas cannot be imported") from exc
+        try:
+            genome = CircuitGenome.from_dict(qnas_genome_dict)
+        except Exception as exc:
+            raise ValueError("Checkpoint contains an invalid qnas_genome") from exc
     else:
         qnas_file = os.path.join(os.path.dirname(checkpoint_path), "qnas_genome.json")
         if os.path.exists(qnas_file):
             try:
                 from qnas import load_genome
-                genome = load_genome(qnas_file)
-            except Exception:
+            except ImportError:
                 try:
                     from qml_models.qnas import load_genome
-                    genome = load_genome(qnas_file)
-                except Exception:
-                    pass
+                except ImportError as exc:
+                    raise RuntimeError("qnas_genome.json exists but qnas cannot be imported") from exc
+            try:
+                genome = load_genome(qnas_file)
+            except Exception as exc:
+                raise ValueError(f"Invalid QNAS genome file: {qnas_file}") from exc
 
     cfg_layers = config.get("n_layers", 3)
     init_depth = len(genome.layers) if genome is not None and hasattr(genome, "layers") else cfg_layers
@@ -380,8 +419,14 @@ def load_hybrid_model(checkpoint_path: str, _device: torch.device, dual_basis_re
         elif head_in_dim == 3 * n_qubits - 1:
             ckpt_dual = False
 
-    # Allow user override from UI if specified, otherwise fall back to checkpoint configuration
-    dual_basis_only = ckpt_dual if dual_basis_readout is None else bool(dual_basis_readout)
+    # The readout is part of the trained prediction function.  A UI toggle must
+    # never silently create a different circuit/head and partially load weights.
+    if dual_basis_readout is not None and bool(dual_basis_readout) != bool(ckpt_dual):
+        raise ValueError(
+            "Checkpoint readout is immutable at inference time: "
+            f"checkpoint dual_basis={ckpt_dual}, requested={bool(dual_basis_readout)}."
+        )
+    dual_basis_only = ckpt_dual
 
     use_qaf_attention = config.get("use_qaf_attention", False)
     clinical_hard = config.get("clinical_hard", False)
@@ -394,13 +439,24 @@ def load_hybrid_model(checkpoint_path: str, _device: torch.device, dual_basis_re
         diff_method=config.get("diff_method", "backprop"),
         dropout=config.get("dropout", 0.3),
         reupload=config.get("reupload", True),
+        p_drop=config.get("p_drop", 0.10),
         use_lora=use_lora,
         genome=genome,
+        q_init_std=config.get("q_init_std", 0.01),
         dual_basis_only=dual_basis_only,
         use_qaf_attention=use_qaf_attention,
         clinical_hard=clinical_hard,
+        preprocess_mode=config.get("preprocess_mode", "biomedclip_normalized"),
         qdevice=config.get("qdevice", "default.qubit"),
     ).to(_device)
+
+    if config.get("finetune_backbone"):
+        model.backbone.load_finetuned_vit(
+            dataset_name=config.get("finetune_dataset", meta.get("dataset_name", "")),
+            n_unfreeze=int(config.get("finetune_unfreeze_layers", 0)),
+            base_dir=config.get("finetune_dir"),
+            device=_device,
+        )
 
     # Grow layers if checkpoint weights indicate progressive expansion (e.g. L=2 -> 4 -> 6)
     if "qlayer.weights" in sd:
@@ -442,12 +498,29 @@ def load_hybrid_model(checkpoint_path: str, _device: torch.device, dual_basis_re
         ).to(_device)
 
     try:
-        model.load_state_dict(adapted_sd, strict=False)
+        missing, unexpected = model.load_state_dict(adapted_sd, strict=False)
     except RuntimeError as err:
-        m_sd = model.state_dict()
-        filtered_sd = {k: v for k, v in adapted_sd.items() if k in m_sd and m_sd[k].shape == v.shape}
-        model.load_state_dict(filtered_sd, strict=False)
-        print(f"[warn] Partial load_state_dict applied for hybrid model: {err}")
+        raise RuntimeError(
+            f"Checkpoint architecture mismatch for {checkpoint_path}: {err}"
+        ) from err
+    critical_missing = [
+        key for key in missing
+        if not key.startswith("backbone.vision_encoder.")
+    ]
+    if critical_missing:
+        raise RuntimeError(
+            "Checkpoint is incomplete; refusing clinical inference with missing "
+            f"prediction parameters: {critical_missing[:8]}"
+        )
+    if unexpected:
+        raise RuntimeError(
+            "Checkpoint contains unexpected prediction parameters; refusing to infer with "
+            f"an unverified architecture: {unexpected[:8]}"
+        )
+
+    # Persist calibration artifacts on the model so every inference path uses
+    # the same post-hoc transformation and conformal calibration set.
+    _restore_calibration_artifacts(model, ckpt, _device, config.get("n_classes", 2))
 
     model.eval()
     return model, meta
@@ -458,17 +531,18 @@ def load_baseline_model(checkpoint_path: str, _device: torch.device):
     """Load trained parameter-matched classical baseline model on-demand."""
     from model import ClassicalBaseline
 
-    ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=False)
+    ckpt = torch.load(checkpoint_path, map_location=_device, weights_only=True)
     meta = ckpt.get("meta", {})
     sd = ckpt["model_state_dict"]
 
     config = ckpt.get("config") or {}
+    genome = None
 
     # 1. Try reading config from hybrid_model.pt in same directory to supplement missing fields
     hybrid_path = os.path.join(os.path.dirname(checkpoint_path), "hybrid_model.pt")
     if os.path.exists(hybrid_path):
         try:
-            h_ckpt = torch.load(hybrid_path, map_location="cpu", weights_only=False)
+            h_ckpt = torch.load(hybrid_path, map_location="cpu", weights_only=True)
             h_config = h_ckpt.get("config", {})
             for k, v in h_config.items():
                 if k not in config or config[k] is None:
@@ -492,6 +566,14 @@ def load_baseline_model(checkpoint_path: str, _device: torch.device):
                             config[k] = v
         except Exception:
             pass
+
+    qnas_genome_dict = config.get("qnas_genome")
+    if qnas_genome_dict is not None:
+        try:
+            from qnas import CircuitGenome
+        except ImportError:
+            from qml_models.qnas import CircuitGenome
+        genome = CircuitGenome.from_dict(qnas_genome_dict)
 
     # 3. Fallback: infer dimensions directly from tensor weights
     if "n_classes" not in config or "n_qubits" not in config:
@@ -527,15 +609,38 @@ def load_baseline_model(checkpoint_path: str, _device: torch.device):
         use_lora=use_lora,
         mlp_hidden_dim=mlp_hidden_dim,
         mlp_in_dim=mlp_in_dim,
+        dual_basis_only=config.get("dual_basis_only", config.get("dual_basis_readout", False)),
+        clinical_hard=config.get("clinical_hard", False),
+        genome=genome,
+        use_qaf_attention=config.get("use_qaf_attention", False),
+        preprocess_mode=config.get("preprocess_mode", "biomedclip_normalized"),
     ).to(_device)
+    if config.get("finetune_backbone"):
+        model.backbone.load_finetuned_vit(
+            dataset_name=config.get("finetune_dataset", meta.get("dataset_name", "")),
+            n_unfreeze=int(config.get("finetune_unfreeze_layers", 0)),
+            base_dir=config.get("finetune_dir"),
+            device=_device,
+        )
     try:
-        model.load_state_dict(sd, strict=False)
+        missing, unexpected = model.load_state_dict(sd, strict=False)
     except RuntimeError as err:
-        m_sd = model.state_dict()
-        filtered_sd = {k: v for k, v in sd.items() if k in m_sd and m_sd[k].shape == v.shape}
-        model.load_state_dict(filtered_sd, strict=False)
-        print(f"[warn] Partial load_state_dict applied for baseline model: {err}")
+        raise RuntimeError(f"Baseline checkpoint architecture mismatch: {err}") from err
+    critical_missing = [
+        key for key in missing
+        if not key.startswith("backbone.vision_encoder.")
+    ]
+    if critical_missing:
+        raise RuntimeError(
+            f"Baseline checkpoint is incomplete; missing parameters: {critical_missing[:8]}"
+        )
+    if unexpected:
+        raise RuntimeError(
+            "Baseline checkpoint contains unexpected parameters: "
+            f"{unexpected[:8]}"
+        )
 
+    _restore_calibration_artifacts(model, ckpt, _device, config.get("n_classes", 2))
     model.to(_device)
     model.eval()
     return model, meta
@@ -570,18 +675,23 @@ def get_calibration_temperature(dataset_name: str) -> float:
     out_dir = get_dataset_output_dir(dataset_name)
     k_sum = get_kfold_summary(dataset_name)
     if k_sum:
-        t_val = k_sum.get("temperature") or k_sum.get("platt_temperature")
+        t_val = (
+            k_sum.get("temperature")
+            or k_sum.get("mean_temperature")
+            or k_sum.get("platt_temperature")
+        )
         if t_val and float(t_val) > 0:
             return float(t_val)
     meta = get_checkpoint_metadata(dataset_name)
     if meta:
         h_met = meta.get("hybrid_metrics", {})
-        if "temperature" in h_met and float(h_met["temperature"]) > 0:
-            return float(h_met["temperature"])
+        for source in (meta.get("meta", {}), meta.get("calibration", {}), h_met):
+            if "temperature" in source and float(source["temperature"]) > 0:
+                return float(source["temperature"])
     for p in [os.path.join(out_dir, "temperature.pt"), os.path.join(out_dir, "calibration.pt")]:
         if os.path.exists(p):
             try:
-                obj = torch.load(p, map_location="cpu", weights_only=False)
+                obj = torch.load(p, map_location="cpu", weights_only=True)
                 if isinstance(obj, (int, float)):
                     return float(obj)
                 elif isinstance(obj, dict) and "temperature" in obj:
@@ -589,6 +699,77 @@ def get_calibration_temperature(dataset_name: str) -> float:
             except Exception:
                 pass
     return 1.0
+
+
+def get_calibration_threshold(dataset_name: str) -> float:
+    """Return the persisted binary operating threshold, never a clinical guess."""
+    k_sum = get_kfold_summary(dataset_name)
+    if k_sum:
+        value = k_sum.get("mean_optimal_threshold")
+        if isinstance(value, (int, float)) and 0.0 < float(value) < 1.0:
+            return float(value)
+    meta = get_checkpoint_metadata(dataset_name)
+    if meta:
+        value = meta.get("meta", {}).get("threshold")
+        if isinstance(value, (int, float)) and 0.0 < float(value) < 1.0:
+            return float(value)
+        value = meta.get("calibration", {}).get("threshold")
+        if isinstance(value, (int, float)) and 0.0 < float(value) < 1.0:
+            return float(value)
+    return 0.5
+
+
+def conformal_prediction_set(
+    probabilities: np.ndarray,
+    calibration_scores: Optional[np.ndarray],
+    alpha: float = 0.05,
+) -> np.ndarray:
+    """Split-conformal prediction set using persisted calibration scores."""
+    if not (0.0 < float(alpha) < 1.0):
+        raise ValueError(f"alpha must be in (0, 1), got {alpha}")
+    probs = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    if probs.size == 0 or not np.isfinite(probs).all():
+        raise ValueError("probabilities must be a non-empty finite vector")
+    if isinstance(calibration_scores, dict):
+        return mondrian_prediction_set(probs, calibration_scores, alpha=alpha)
+    if calibration_scores is None or len(calibration_scores) == 0:
+        return np.asarray([int(np.argmax(probs))], dtype=int)
+    scores = np.asarray(calibration_scores, dtype=np.float64).reshape(-1)
+    if not np.isfinite(scores).all():
+        raise ValueError("calibration_scores must contain only finite values")
+    scores = np.clip(scores, 0.0, 1.0)
+    n = len(scores)
+    q_level = min(1.0, np.ceil((n + 1) * (1.0 - alpha)) / n)
+    q_hat = float(np.quantile(scores, q_level, method="higher"))
+    selected = np.flatnonzero(probs >= (1.0 - q_hat - 1e-12))
+    return selected if len(selected) else np.asarray([int(np.argmax(probs))], dtype=int)
+
+
+def _merge_conformal_artifacts(models) -> Optional[Dict]:
+    """Merge per-class Mondrian calibration scores across ensemble members."""
+    artifacts = [getattr(model, "_conformal_scores", None) for model in models]
+    artifacts = [item for item in artifacts if isinstance(item, dict)]
+    if not artifacts:
+        return None
+    merged: Dict[str, list] = {}
+    for artifact in artifacts:
+        for class_key, scores in artifact.get("scores_by_class", {}).items():
+            merged.setdefault(str(class_key), []).extend(scores)
+    quantiles = {}
+    for class_key, scores in merged.items():
+        if scores:
+            values = np.asarray(scores, dtype=np.float64)
+            q_level = min(1.0, np.ceil((len(values) + 1) * 0.95) / len(values))
+            quantiles[class_key] = float(np.quantile(values, q_level, method="higher"))
+        else:
+            quantiles[class_key] = 1.0
+    return {
+        "method": "mondrian_split_conformal",
+        "alpha": 0.05,
+        "n_classes": len(quantiles),
+        "scores_by_class": merged,
+        "quantiles": quantiles,
+    }
 
 
 def fig_to_base64(fig) -> str:
@@ -707,18 +888,24 @@ def preprocess_image(
     image: Image.Image,
     in_channels: int = 3,
     target_size: int = 224,
+    preprocess_mode: str = "biomedclip_normalized",
 ) -> torch.Tensor:
-    """Resize to target_size (default: 224×224), convert to 3-channel RGB, normalize with BiomedCLIP statistics."""
+    """Prepare one image according to the checkpoint's preprocessing contract."""
     image = image.convert("RGB")
     image = image.resize((target_size, target_size), Image.LANCZOS)
 
-    mean = [0.48145466, 0.4578275, 0.40821073]
-    std  = [0.26862954, 0.26130258, 0.27577711]
-    tfm = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=mean, std=std),
-    ])
-    tensor = tfm(image).unsqueeze(0)  # (1, 3, target_size, target_size)
+    tensor = transforms.ToTensor()(image)
+    if preprocess_mode == "raw_uint8":
+        tensor = tensor * 255.0
+    elif preprocess_mode == "raw_float01":
+        pass
+    elif preprocess_mode == "biomedclip_normalized":
+        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], dtype=tensor.dtype).view(3, 1, 1)
+        std = torch.tensor([0.26862954, 0.26130258, 0.27577711], dtype=tensor.dtype).view(3, 1, 1)
+        tensor = (tensor - mean) / std
+    else:
+        raise ValueError(f"Unknown checkpoint preprocessing mode: {preprocess_mode}")
+    tensor = tensor.unsqueeze(0)
     return tensor
 
 
@@ -793,6 +980,29 @@ def get_test_batch(dataset_name: str, batch_size: int = 16, size: int = 224) -> 
     return torch.stack(images), torch.tensor(labels)
 
 
+def _calibrated_probabilities(model, logits: torch.Tensor, t_scale: Optional[float] = None) -> torch.Tensor:
+    """Apply the checkpoint's persisted temperature and probability calibrator."""
+    stored_temperature = float(getattr(model, "_calibration_temperature", 1.0))
+    temperature = stored_temperature if t_scale is None else float(t_scale)
+    probs = F.softmax(logits / max(0.01, temperature), dim=1)
+    calibrator = getattr(model, "_calibrator", None)
+    if calibrator is not None:
+        with torch.no_grad():
+            probs = calibrator(probs)
+    return probs
+
+
+def _apply_decision_policy(probabilities: np.ndarray, model) -> int:
+    """Apply the checkpoint-owned multiclass policy to one probability vector."""
+    policy = getattr(model, "_decision_policy", {}) or {}
+    if policy.get("type") == "cost_matrix" and policy.get("cost_matrix") is not None:
+        return int(predict_with_cost_matrix(
+            np.asarray(probabilities, dtype=np.float64).reshape(1, -1),
+            np.asarray(policy["cost_matrix"], dtype=np.float64),
+        )[0])
+    return int(np.argmax(probabilities))
+
+
 def mc_dropout_inference(
     model,
     image_tensor: torch.Tensor,
@@ -800,9 +1010,9 @@ def mc_dropout_inference(
     n_samples: int = 10,
     noise_std: float = 0.02,
     cached_features: Optional[torch.Tensor] = None,
-    t_scale: float = 1.0,
+    t_scale: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray, list, np.ndarray]:
-    """Quantum MC Dropout: T forward passes with parameter noise on quantum circuit and temperature scaling."""
+    """Stochastic quantum-parameter inference with persisted calibration."""
     model.to(device)
     model.eval()
 
@@ -814,7 +1024,6 @@ def mc_dropout_inference(
             image_tensor = image_tensor.to(device)
             z = model.backbone(image_tensor)
 
-    t_scale_eff = max(0.01, float(t_scale))
     z_np = z.detach().cpu().numpy().flatten()
 
     # Fast deterministic evaluation if no noise or single sample requested
@@ -823,8 +1032,7 @@ def mc_dropout_inference(
             exp = model.qlayer(z)
             if isinstance(exp, (list, tuple)):
                 exp = torch.stack(exp, dim=-1)
-            logits = model.head(exp) / t_scale_eff
-            probs = F.softmax(logits, dim=1).cpu().numpy().flatten()
+            probs = _calibrated_probabilities(model, model.head(exp), t_scale).cpu().numpy().flatten()
             exps = [exp.cpu().numpy().flatten()]
             return probs, np.zeros_like(probs), exps, z_np
 
@@ -841,8 +1049,7 @@ def mc_dropout_inference(
             exp = model.qlayer(z)
             if isinstance(exp, (list, tuple)):
                 exp = torch.stack(exp, dim=-1)
-            logits = model.head(exp) / t_scale_eff
-            probs = F.softmax(logits, dim=1)
+            probs = _calibrated_probabilities(model, model.head(exp), t_scale)
             all_probs.append(probs.cpu().numpy().flatten())
             all_exps.append(exp.cpu().numpy().flatten())
 
@@ -862,9 +1069,9 @@ def mc_dropout_baseline(
     device: torch.device,
     n_samples: int = 10,
     cached_features: Optional[torch.Tensor] = None,
-    t_scale: float = 1.0,
+    t_scale: Optional[float] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Classical MC Dropout: evaluates classical baseline with active dropout across T passes and temperature scaling."""
+    """Classical stochastic dropout inference with persisted calibration."""
     baseline_model.to(device)
     baseline_model.eval()
 
@@ -878,12 +1085,10 @@ def mc_dropout_baseline(
     # Enable dropout in MLP for stochastic passes
     baseline_model.mlp.train()
 
-    t_scale_eff = max(0.01, float(t_scale))
     with torch.inference_mode():
         z_rep = z.repeat(n_samples, 1)
         h_rep = baseline_model.mlp(z_rep)
-        logits_rep = baseline_model.head(h_rep) / t_scale_eff
-        probs_rep = F.softmax(logits_rep, dim=1).cpu().numpy()
+        probs_rep = _calibrated_probabilities(baseline_model, baseline_model.head(h_rep), t_scale).cpu().numpy()
 
     baseline_model.eval()
     mean_probs = probs_rep.mean(axis=0)
@@ -1091,16 +1296,11 @@ def main():
 
         # Post-hoc Platt Calibration
         cal_temp = get_calibration_temperature(dataset_name)
+        persisted_tau = get_calibration_threshold(dataset_name)
         st.divider()
         st.subheader("🌡️ Calibration")
-        use_calibration = st.toggle(
-            "Platt Temperature Scaling",
-            value=(cal_temp != 1.0),
-            help=f"Scales pre-softmax logits by calibrated temperature T*={cal_temp:.3f} to prevent overconfident misdiagnosis.",
-        )
-        t_scale = cal_temp if use_calibration else 1.0
-        if use_calibration:
-            st.caption(f"✓ Active Temperature $T^* = {t_scale:.3f}$")
+        st.caption(f"✓ Checkpoint-locked temperature $T^* = {cal_temp:.3f}$")
+        t_scale = cal_temp
 
         is_binary = DATASET_CONFIG[dataset_name]["n_classes"] == 2
         if is_binary:
@@ -1108,26 +1308,22 @@ def main():
             st.subheader("🎯 Clinical Operating Mode")
             mode_choice = st.radio(
                 "Operating Strategy",
-                ["⚖️ Balanced Clinical", "🔍 Screening (Max Sens)", "🛡️ High Specificity (≥90%)", "🎚️ Custom Threshold"],
+                ["⚖️ Checkpoint-Calibrated", "🎚️ Custom Threshold"],
                 index=0,
-                help="Adjust the decision threshold to trade off Sensitivity vs Specificity"
+                help="The default threshold is fitted on held-out calibration data and persisted with the checkpoint."
             )
-            if mode_choice == "🔍 Screening (Max Sens)":
-                custom_tau = 0.51
-                st.caption("• **Sensitivity**: ~98.7%  |  **Specificity**: ~83.8%\n• Minimizes false negatives / missed pneumonia.")
-            elif mode_choice == "⚖️ Balanced Clinical":
-                custom_tau = 0.55
-                st.caption("• **Sensitivity**: ~96.2%  |  **Specificity**: ~87.6%\n• Optimal clinical compromise between TPR & TNR.")
-            elif mode_choice == "🛡️ High Specificity (≥90%)":
-                custom_tau = 0.58
-                st.caption("• **Sensitivity**: ~90.8%  |  **Specificity**: ~90.6%\n• Suppresses false alarms (reduces normal misdiagnosis).")
+            if mode_choice == "⚖️ Checkpoint-Calibrated":
+                custom_tau = persisted_tau
+                st.caption(f"✓ Held-out calibration threshold $τ^* = {custom_tau:.3f}$")
             else:
-                custom_tau = st.slider("Decision Threshold (τ*)", 0.10, 0.90, 0.55, step=0.01)
+                custom_tau = st.slider("Decision Threshold (τ*)", 0.10, 0.90, float(persisted_tau), step=0.01)
+            baseline_tau = custom_tau
             enable_boost = False
             boost_cls = None
             boost_tau = None
         else:
             custom_tau = 0.50
+            baseline_tau = 0.50
             mode_choice = "Multi-Class Decision"
             st.divider()
             st.subheader("🎯 Multi-Class Priority Alert")
@@ -1162,6 +1358,7 @@ def main():
             "Observable Readout Scheme",
             ["dual_basis_readout", "normal readout"],
             index=0 if default_is_dual else 1,
+            disabled=True,
             format_func=lambda x: "🧬 Dual-Basis Readout (Z + X)" if x == "dual_basis_readout" else "⚛️ Normal Readout (Z + ZZ + X)",
             help=(
                 "Choose between:\n"
@@ -1169,7 +1366,7 @@ def main():
                 "• normal readout: 3n - 1 observables (Z + nearest-neighbor ZZ + X) capturing entangling correlations."
             ),
         )
-        use_dual_basis = (readout_choice == "dual_basis_readout")
+        use_dual_basis = bool(default_is_dual)
         if use_dual_basis:
             st.caption("• **Active Scheme**: Dual-Basis ($2n$ local $\\langle Z_i \\rangle$ & $\\langle X_i \\rangle$ observables)")
         else:
@@ -1392,11 +1589,29 @@ def main():
                 h_model_res, b_model_res, meta = get_loaded_models()
                 st.session_state["models_loaded"] = True
 
+                if is_binary and mode_choice == "⚖️ Checkpoint-Calibrated" and b_model_res is not None:
+                    if not is_kfold:
+                        baseline_tau = float(getattr(b_model_res, "_decision_threshold", baseline_tau))
+                    elif is_kfold and b_model_res:
+                        fold_thresholds = [
+                            float(getattr(m, "_decision_threshold", baseline_tau))
+                            for m in b_model_res
+                            if isinstance(getattr(m, "_decision_threshold", baseline_tau), (int, float))
+                        ]
+                        if fold_thresholds:
+                            baseline_tau = float(np.mean(fold_thresholds))
 
                 if (is_kfold and h_model_res) or (not is_kfold and h_model_res is not None):
                     primary_h = h_model_res[0] if is_kfold else h_model_res
 
                     # Robust tensor preprocessing: enforce 4D (B, 3, 224, 224) and float32
+                    checkpoint_mode = getattr(primary_h.backbone, "preprocess_mode", "biomedclip_normalized")
+                    checkpoint_mode = getattr(checkpoint_mode, "value", checkpoint_mode)
+                    if images_list and not use_sample:
+                        images_tensor = torch.cat(
+                            [preprocess_image(im, cfg["in_channels"], preprocess_mode=checkpoint_mode) for im in images_list],
+                            dim=0,
+                        )
                     images_tensor = images_tensor.float()
                     if images_tensor.ndim == 3:
                         images_tensor = images_tensor.unsqueeze(0)
@@ -1410,6 +1625,10 @@ def main():
                     # Fast batch feature extraction (Intel NPU or PyTorch):
                     if use_npu:
                         try:
+                            if checkpoint_mode != "biomedclip_normalized":
+                                raise RuntimeError(
+                                    "OpenVINO direct encoder path requires normalized checkpoint inputs"
+                                )
                             with st.spinner("⚡ Offloading 86M ViT to Intel NPU via OpenVINO..."):
                                 compiled_npu, chosen_dev = get_compiled_npu_vision_encoder(primary_h)
                                 out_layer = compiled_npu.output(0)
@@ -1452,7 +1671,7 @@ def main():
                                     m, tens_i, device,
                                     n_samples=n_mc_samples, noise_std=noise_std,
                                     cached_features=feat_i,
-                                    t_scale=t_scale,
+                                    t_scale=None,
                                 )
                                 fold_mean_probs_h.append(mph)
                                 fold_std_probs_h.append(sph)
@@ -1473,7 +1692,7 @@ def main():
                                         bm, tens_i, device,
                                         n_samples=n_mc_samples,
                                         cached_features=feat_i,
-                                        t_scale=t_scale,
+                                        t_scale=None,
                                     )
                                     fold_mean_probs_b.append(mpb)
                                     fold_std_probs_b.append(spb)
@@ -1493,20 +1712,21 @@ def main():
                                 cls_h = label_map.get(p_h, str(p_h))
 
                                 if mean_probs_b is not None:
-                                    p_b = 1 if mean_probs_b[1] >= custom_tau else 0
+                                    p_b = 1 if mean_probs_b[1] >= baseline_tau else 0
                                     c_b = float(mean_probs_b[p_b])
                                     u_b = float(std_probs_b[p_b])
                                     cls_b = label_map.get(p_b, str(p_b))
                                 else:
                                     p_b, c_b, u_b, cls_b = None, 0.0, 0.0, "N/A"
                             else:
-                                p_h = int(np.argmax(mean_probs_h))
+                                p_h = _apply_decision_policy(mean_probs_h, primary_h)
                                 c_h = float(mean_probs_h[p_h])
                                 u_h = float(std_probs_h[p_h])
                                 cls_h = label_map.get(p_h, str(p_h))
 
                                 if mean_probs_b is not None:
-                                    p_b = int(np.argmax(mean_probs_b))
+                                    primary_b_for_policy = b_model_res[0] if is_kfold else b_model_res
+                                    p_b = _apply_decision_policy(mean_probs_b, primary_b_for_policy)
                                     c_b = float(mean_probs_b[p_b])
                                     u_b = float(std_probs_b[p_b])
                                     cls_b = label_map.get(p_b, str(p_b))
@@ -1644,13 +1864,15 @@ def main():
                             unsafe_allow_html=True,
                         )
 
-                        # Conformal prediction
+                        # Split-conformal prediction set calibrated during training.
                         alpha_conf = 0.05
-                        sorted_p = np.sort(mean_probs_h)[::-1]
-                        set_size_h = np.searchsorted(np.cumsum(sorted_p), 1 - alpha_conf) + 1
-                        pred_set_h = np.argsort(mean_probs_h)[::-1][:set_size_h]
+                        if is_kfold:
+                            conformal_scores = _merge_conformal_artifacts(h_model_res)
+                        else:
+                            conformal_scores = getattr(primary_h, "_conformal_scores", None)
+                        pred_set_h = conformal_prediction_set(mean_probs_h, conformal_scores, alpha_conf)
                         names_h = [label_map.get(c, str(c)) for c in pred_set_h]
-                        st.caption(f"**95% Conformal Set**: {', '.join(names_h)}")
+                        st.caption(f"**95% Split-Conformal Set**: {', '.join(names_h)}")
 
                     # Baseline Card
                     if mean_probs_b is not None:
@@ -1671,11 +1893,13 @@ def main():
                                 unsafe_allow_html=True,
                             )
 
-                            sorted_pb = np.sort(mean_probs_b)[::-1]
-                            set_size_b = np.searchsorted(np.cumsum(sorted_pb), 1 - alpha_conf) + 1
-                            pred_set_b = np.argsort(mean_probs_b)[::-1][:set_size_b]
+                            if is_kfold:
+                                conformal_scores_b = _merge_conformal_artifacts(b_model_res)
+                            else:
+                                conformal_scores_b = getattr(b_model_res, "_conformal_scores", None)
+                            pred_set_b = conformal_prediction_set(mean_probs_b, conformal_scores_b, alpha_conf)
                             names_b = [label_map.get(c, str(c)) for c in pred_set_b]
-                            st.caption(f"**95% Conformal Set**: {', '.join(names_b)}")
+                            st.caption(f"**95% Split-Conformal Set**: {', '.join(names_b)}")
 
                     # ── 3. Delta Metrics ──────────────────────────────────────
                     if mean_probs_b is not None:
@@ -2057,6 +2281,12 @@ def main():
         st.header("🏋️ Quantum Model Training & Laboratory")
 
         # ── 1. Authentication Gatekeeper ──────────────────────────────────
+        try:
+            _auth_secrets = st.secrets.get("training_auth", {})
+        except Exception:
+            _auth_secrets = {}
+        configured_auth_user = os.environ.get("QML_TRAIN_USERNAME", _auth_secrets.get("username", ""))
+        configured_auth_password = os.environ.get("QML_TRAIN_PASSWORD", _auth_secrets.get("password", ""))
         if not st.session_state.get("training_auth", False):
             st.subheader("🔒 Authentication Required")
             st.markdown("Please enter authorized credentials to access the Training Suite, Analysis Gallery, and Performance Outputs.")
@@ -2070,20 +2300,31 @@ def main():
 
                 login_btn = st.form_submit_button("🔓 Unlock Training Access", use_container_width=True)
                 if login_btn:
-                    if user_input.strip() == "vrushabh_qml" and pass_input.strip() == "vrush1108":
+                    valid_user = bool(configured_auth_user) and hmac.compare_digest(
+                        user_input.strip(), configured_auth_user
+                    )
+                    valid_password = bool(configured_auth_password) and hmac.compare_digest(
+                        pass_input, configured_auth_password
+                    )
+                    if valid_user and valid_password:
                         st.session_state["training_auth"] = True
-                        st.success("✅ Access granted! Welcome, vrushabh_qml.")
+                        st.session_state["training_auth_user"] = user_input.strip()
+                        st.success("✅ Access granted.")
                         st.rerun()
                     else:
-                        st.error("❌ Access denied: Invalid username or password.")
+                        st.error("❌ Access denied: Invalid username or password, or training credentials are not configured.")
         else:
             # Authenticated Header
             auth_head1, auth_head2 = st.columns([5, 1])
             with auth_head1:
-                st.caption("👤 Logged in as **vrushabh_qml** • Authorized for Model Training, Retraining, and Benchmark Inspection")
+                st.caption(
+                    f"👤 Logged in as **{st.session_state.get('training_auth_user', 'authorized user')}** "
+                    "• Authorized for Model Training, Retraining, and Benchmark Inspection"
+                )
             with auth_head2:
                 if st.button("🚪 Logout", key="btn_train_logout", use_container_width=True):
                     st.session_state["training_auth"] = False
+                    st.session_state.pop("training_auth_user", None)
                     st.rerun()
 
             # Sub-Tabs for Training, Gallery, and Summary

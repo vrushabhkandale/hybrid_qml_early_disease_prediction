@@ -34,6 +34,7 @@ print("[engine] Initializing Hybrid CNN-VQC Engine (loading dependencies)...", f
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -70,6 +71,8 @@ from scipy import stats as sp_stats
 from sklearn.manifold import TSNE
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
     auc,
     average_precision_score,
     classification_report,
@@ -80,6 +83,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from sklearn.preprocessing import label_binarize
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 
@@ -271,32 +275,101 @@ def build_multi_rate_optimizer(
 # ═══════════════════════════════════════════════════════════════════════════
 # 2.5 FEATURE CACHING
 # ═══════════════════════════════════════════════════════════════════════════
+FEATURE_CACHE_SCHEMA_VERSION = "3.0"
+
+
+def _feature_cache_contract(model, loader, extra_metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Build a reproducibility contract for an extracted feature cache.
+
+    Cache files are training inputs, not disposable speedups.  The contract
+    binds them to the dataset ordering/labels, preprocessing owner, encoder
+    identity, and requested split so a stale cache cannot silently change the
+    clinical experiment.
+    """
+    dataset = getattr(loader, "dataset", None)
+    labels = getattr(dataset, "labels", None)
+    if labels is None and hasattr(dataset, "tensors") and len(dataset.tensors) >= 2:
+        labels = dataset.tensors[1]
+    if torch.is_tensor(labels):
+        labels_np = labels.detach().cpu().numpy()
+    elif labels is not None:
+        labels_np = np.asarray(labels)
+    else:
+        labels_np = np.empty((0,), dtype=np.int64)
+    labels_np = np.ascontiguousarray(labels_np)
+
+    backbone = getattr(model, "backbone", None)
+    preprocess_mode = str(getattr(backbone, "preprocess_mode", "unknown"))
+    encoder_id = getattr(backbone, "encoder_id", "BiomedCLIP-PubMedBERT_256-vit_base_patch16_224")
+    encoder_source = getattr(backbone, "encoder_source", "pretrained")
+    contract = {
+        "schema_version": FEATURE_CACHE_SCHEMA_VERSION,
+        "dataset_class": (
+            f"{dataset.__class__.__module__}.{dataset.__class__.__qualname__}"
+            if dataset is not None else "unknown"
+        ),
+        "n_samples": int(len(dataset)) if dataset is not None else int(len(labels_np)),
+        "label_sha256": hashlib.sha256(labels_np.tobytes()).hexdigest(),
+        "feature_dim": 512,
+        "feature_dtype": "torch.float32",
+        "preprocess_mode": preprocess_mode,
+        "encoder_id": encoder_id,
+        "encoder_source": encoder_source,
+    }
+    if extra_metadata:
+        contract.update({str(k): v for k, v in extra_metadata.items()})
+    return contract
+
+
 def extract_and_cache_features(
     model: torch.nn.Module,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
     cache_path: str,
     cache_in_vram: bool = False,
+    cache_metadata: Optional[Dict[str, Any]] = None,
 ) -> torch.utils.data.DataLoader:
     import os
     import gc
+    expected_contract = _feature_cache_contract(model, loader, cache_metadata)
+    use_existing = False
     if os.path.exists(cache_path):
-        print(f"[cache] Loading extracted features from {cache_path}")
-        data = torch.load(cache_path, map_location="cpu")
-        all_features = data["features"]
-        all_labels = data["labels"]
-    else:
+        try:
+            data = torch.load(cache_path, map_location="cpu", weights_only=True)
+            use_existing = data.get("cache_contract") == expected_contract
+            if use_existing:
+                print(f"[cache] Loading verified feature cache from {cache_path}")
+                all_features = data["features"]
+                all_labels = data["labels"]
+            else:
+                print(f"[cache] Rejecting stale or legacy feature cache: {cache_path}")
+        except Exception as exc:
+            print(f"[cache] Rejecting unreadable feature cache ({exc}): {cache_path}")
+
+    if not use_existing:
         print(f"[cache] Extracting features to {cache_path}...")
         model.eval()
         all_features = []
         all_labels = []
-        extract_chunk_size = min(loader.batch_size, 32)
+
+        # Never extract through a WeightedRandomSampler.  Sampling with
+        # replacement would cache duplicates and omit patients, permanently
+        # changing the training cohort.  Cache the underlying dataset once in
+        # deterministic order, then recreate the requested sampler below.
+        source_loader = torch.utils.data.DataLoader(
+            loader.dataset,
+            batch_size=loader.batch_size or 32,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+        )
+        extract_chunk_size = min(source_loader.batch_size or 32, 32)
         with torch.inference_mode():
-            for batch_i, (images, labels) in enumerate(tqdm(loader, desc="Caching features", leave=False)):
+            for batch_i, (images, labels) in enumerate(tqdm(source_loader, desc="Caching features", leave=False)):
                 labels = labels.squeeze().long()
                 b_sz = images.size(0)
                 sub_feats = []
-                # Chunk large batches into mini-batches of <= 32 to prevent CUDA OOM on ViT-B/16
                 for start_idx in range(0, b_sz, extract_chunk_size):
                     end_idx = min(start_idx + extract_chunk_size, b_sz)
                     chunk_imgs = images[start_idx:end_idx].to(device)
@@ -310,10 +383,17 @@ def extract_and_cache_features(
 
                 if (batch_i + 1) % 50 == 0 and torch.cuda.is_available():
                     torch.cuda.empty_cache()
-        
-        all_features = torch.cat(all_features, dim=0)
+
+        all_features = torch.cat(all_features, dim=0).float()
         all_labels = torch.cat(all_labels, dim=0)
-        torch.save({"features": all_features, "labels": all_labels}, cache_path)
+        expected_contract["n_samples"] = int(all_features.shape[0])
+        expected_contract["feature_dim"] = int(all_features.shape[-1])
+        expected_contract["feature_dtype"] = str(all_features.dtype)
+        torch.save({
+            "cache_contract": expected_contract,
+            "features": all_features,
+            "labels": all_labels,
+        }, cache_path)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -460,8 +540,9 @@ def _compute_entanglement_entropy_batch(
             q_val = q_val + (1.0 - purity)
 
         q_mw = (2.0 / float(n_qubits)) * q_val
-        s_eff = torch.maximum(s_cont, q_mw * float(n_a))
-        entropies.append(s_eff)
+        # Meyer-Wallach and bipartite entropy are different measures. A maximum
+        # between them is not von Neumann entropy and can create a false floor.
+        entropies.append(s_cont)
 
     if entropies:
         return torch.stack(entropies).mean()
@@ -997,7 +1078,8 @@ def evaluate(
 
         if cost_matrix is not None and logits.size(1) == cost_matrix.size(0):
             cm = cost_matrix.to(logits.device)
-            risk = torch.matmul(probs, cm)
+            # cm[action, true_class] -> expected risk = C @ p.
+            risk = torch.matmul(probs, cm.transpose(0, 1))
             preds = risk.argmin(dim=1).cpu()
         else:
             preds = logits.argmax(dim=1).cpu()
@@ -1036,6 +1118,21 @@ def evaluate(
         "probs":    all_probs,
         "logits":   all_logits_cat,  # raw logits for temperature scaling (no double-log)
     }
+    result["balanced_accuracy"] = float(balanced_accuracy_score(all_labels, all_preds))
+    result["macro_f1"] = float(f1_score(all_labels, all_preds, average="macro", zero_division=0))
+    try:
+        if n_classes == 2:
+            result["auprc"] = float(average_precision_score(all_labels, all_probs[:, 1]))
+        else:
+            result["auprc"] = float(
+                average_precision_score(
+                    label_binarize(all_labels, classes=np.arange(n_classes)),
+                    all_probs,
+                    average="macro",
+                )
+            )
+    except ValueError:
+        result["auprc"] = float("nan")
     if all_latents:
         result["latents"] = torch.cat(all_latents).numpy()
         result["latent_labels"] = all_labels[:len(result["latents"])]
@@ -1050,6 +1147,30 @@ def evaluate(
                 break
 
     return result
+
+
+def evaluate_training_epoch_metrics(
+    model: nn.Module,
+    loader,
+    criterion: nn.Module,
+    device: torch.device,
+    n_classes: int,
+    max_samples: int = 1000,
+) -> Dict[str, float]:
+    """Evaluate task metrics at an epoch boundary with no train-time augmentation.
+
+    This is intentionally separate from ``train_one_epoch``: online mixup,
+    quantum perturbations, dropout, and balanced sampling are training
+    procedures, not comparable measurements of the learned task function.
+    """
+    result = evaluate(model, loader, criterion, device, n_classes, max_samples=max_samples)
+    return {
+        "loss": float(result["loss"]),
+        "accuracy": float(result["accuracy"]),
+        "balanced_accuracy": float(result["balanced_accuracy"]),
+        "macro_f1": float(result["macro_f1"]),
+        "auprc": float(result["auprc"]),
+    }
 # ═══════════════════════════════════════════════════════════════════════════
 # 3.  ADVANCED QML OPTIMIZATION & CONTINUAL LEARNING (Decoupled modules)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1218,6 +1339,8 @@ try:
         QuantumMultiClassCalibrator,
         optimize_multiclass_cost_sensitive_thresholds,
         predict_with_cost_matrix,
+        build_mondrian_conformal_artifact,
+        split_calibration_indices,
         optimize_decision_threshold,
     )
 except ImportError:
@@ -1228,6 +1351,8 @@ except ImportError:
         QuantumMultiClassCalibrator,
         optimize_multiclass_cost_sensitive_thresholds,
         predict_with_cost_matrix,
+        build_mondrian_conformal_artifact,
+        split_calibration_indices,
         optimize_decision_threshold,
     )
 
@@ -1312,8 +1437,8 @@ def train_progressive_hybrid(
     qsam_h = QSAM(opt_hybrid, hybrid, rho=0.05) if use_qsam else None
     infonce_fn = QuantumInfoNCELoss(n_qubits, tau=0.07).to(device) if lambda_infonce > 0 else None
 
-    hybrid_hist = {"train_loss": [], "train_total_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    baseline_hist = {"train_loss": [], "train_total_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+    hybrid_hist = {"train_loss": [], "train_total_loss": [], "val_loss": [], "train_acc": [], "val_acc": [], "train_balanced_accuracy": [], "val_balanced_accuracy": [], "train_macro_f1": [], "val_macro_f1": [], "train_auprc": [], "val_auprc": []}
+    baseline_hist = {"train_loss": [], "train_total_loss": [], "val_loss": [], "train_acc": [], "val_acc": [], "train_balanced_accuracy": [], "val_balanced_accuracy": [], "train_macro_f1": [], "val_macro_f1": [], "train_auprc": [], "val_auprc": []}
     all_grad_norms_vqc = []
     all_grad_norms_adapter = []
     all_grad_norms_head = []
@@ -1404,12 +1529,16 @@ def train_progressive_hybrid(
             t_hybrid = time.time() - t0
             epoch_times_hybrid.append(t_hybrid)
             val_res_h = evaluate(hybrid, val_loader, criterion, device, n_classes, max_samples=1000)
+            train_eval_h = evaluate_training_epoch_metrics(hybrid, train_loader, criterion, device, n_classes, max_samples=1000)
 
             hybrid_hist["train_loss"].append(train_res_h["loss"])
             hybrid_hist["train_total_loss"].append(train_res_h.get("total_loss", train_res_h["loss"]))
             hybrid_hist["val_loss"].append(val_res_h["loss"])
-            hybrid_hist["train_acc"].append(train_res_h["accuracy"])
+            hybrid_hist["train_acc"].append(train_eval_h["accuracy"])
             hybrid_hist["val_acc"].append(val_res_h["accuracy"])
+            for key in ("balanced_accuracy", "macro_f1", "auprc"):
+                hybrid_hist[f"train_{key}"].append(train_eval_h[key])
+                hybrid_hist[f"val_{key}"].append(val_res_h[key])
             all_grad_norms_vqc.extend(train_res_h.get("grad_norms_vqc", []))
             all_grad_norms_adapter.extend(train_res_h.get("grad_norms_adapter", []))
             all_grad_norms_head.extend(train_res_h.get("grad_norms_head", []))
@@ -1425,6 +1554,7 @@ def train_progressive_hybrid(
             t_baseline = time.time() - t0
             epoch_times_baseline.append(t_baseline)
             val_res_b = evaluate(baseline, val_loader, criterion, device, n_classes, max_samples=1000)
+            train_eval_b = evaluate_training_epoch_metrics(baseline, train_loader, criterion, device, n_classes, max_samples=1000)
 
             # Track best baseline model across all stages
             val_b_auc = val_res_b.get("auroc", val_res_b["accuracy"])
@@ -1450,8 +1580,11 @@ def train_progressive_hybrid(
             baseline_hist["train_loss"].append(train_res_b["loss"])
             baseline_hist["train_total_loss"].append(train_res_b.get("total_loss", train_res_b["loss"]))
             baseline_hist["val_loss"].append(val_res_b["loss"])
-            baseline_hist["train_acc"].append(train_res_b["accuracy"])
+            baseline_hist["train_acc"].append(train_eval_b["accuracy"])
             baseline_hist["val_acc"].append(val_res_b["accuracy"])
+            for key in ("balanced_accuracy", "macro_f1", "auprc"):
+                baseline_hist[f"train_{key}"].append(train_eval_b[key])
+                baseline_hist[f"val_{key}"].append(val_res_b[key])
 
             # Entanglement entropy & KTA (vectorized GPU state evaluation)
             active_nq = getattr(hybrid, "actual_n_qubits", getattr(hybrid, "n_qubits", n_qubits))
@@ -1863,7 +1996,13 @@ def run_training(
             device=str(device),
         )
         print(f"\n[vit_finetune] Initiating BiomedCLIP ViT fine-tuning ({vit_unfreeze_layers} layers, lr={vit_finetune_lr}, epochs={vit_epochs}, classes={n_classes})...")
-        finetune_biomedclip_vit(ft_cfg, train_loader, val_loader=val_loader, device=device, n_classes=n_classes)
+        finetune_biomedclip_vit(
+            ft_cfg,
+            train_loader,
+            val_loader=val_loader,
+            device=device,
+            n_classes=n_classes,
+        )
         print(f"[vit_finetune] Fine-tuned ViT weights saved to: {biomedclip_dir}/{dataset_name}_biomedclip_vit.pt\n")
 
     # ── Build models ──────────────────────────────────────────────────────
@@ -1875,15 +2014,35 @@ def run_training(
         dual_basis_only=dual_basis_readout,
         use_qaf_attention=use_qaf_attention,
         clinical_hard=clinical_hard,
+        finetune_backbone=enable_vit_finetuning,
+        ft_dataset_name=dataset_name,
+        ft_n_unfreeze=vit_unfreeze_layers,
+        ft_base_dir=biomedclip_dir,
     )
 
     # ── Offline Feature Extraction (Resolution-Aware Cache) ───────────────
     cache_dir = os.path.join(out_dir, f"cache_{image_size}")
     os.makedirs(cache_dir, exist_ok=True)
     print(f"[cache] Starting offline feature extraction (Cache: {cache_dir})...")
-    train_loader = extract_and_cache_features(hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"), cache_in_vram=cache_in_vram)
-    val_loader = extract_and_cache_features(hybrid, val_loader, device, os.path.join(cache_dir, "val.pt"), cache_in_vram=cache_in_vram)
-    test_loader = extract_and_cache_features(hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"), cache_in_vram=cache_in_vram)
+    cache_common = {
+        "dataset_name": dataset_name,
+        "image_size": int(image_size),
+        "encoder_mode": "finetuned" if enable_vit_finetuning else "frozen",
+        "finetune_layers": int(vit_unfreeze_layers) if enable_vit_finetuning else 0,
+        "finetune_dir": str(biomedclip_dir),
+    }
+    train_loader = extract_and_cache_features(
+        hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"),
+        cache_in_vram=cache_in_vram, cache_metadata={**cache_common, "split": "train"},
+    )
+    val_loader = extract_and_cache_features(
+        hybrid, val_loader, device, os.path.join(cache_dir, "val.pt"),
+        cache_in_vram=cache_in_vram, cache_metadata={**cache_common, "split": "val"},
+    )
+    test_loader = extract_and_cache_features(
+        hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"),
+        cache_in_vram=cache_in_vram, cache_metadata={**cache_common, "split": "test"},
+    )
 
     # Offload ViT vision encoder to CPU to free GPU VRAM for downstream VQC training
     hybrid.offload_vision_encoder()
@@ -1925,6 +2084,13 @@ def run_training(
             metadata={"dataset": dataset_name, "n_qubits": n_qubits, "epochs": pretrain_epochs, "use_lora": use_lora}
         )
         print(f"[adapter] Saved pre-trained weights and diagnostic plots to: {adapter_dir}\n")
+
+    # The baseline is a classical control, not a different representation
+    # learning experiment.  Start it from the same pretrained CQ projection
+    # and then let its MLP optimize independently from the hybrid head.
+    baseline.backbone.cq_adapter.load_state_dict(copy.deepcopy(hybrid.backbone.cq_adapter.state_dict()))
+    if hasattr(hybrid.backbone, "skip") and hasattr(baseline.backbone, "skip"):
+        baseline.backbone.skip.load_state_dict(copy.deepcopy(hybrid.backbone.skip.state_dict()))
 
     print("[pretrain] CQ Adapter & Residual Skip remain trainable — will be fine-tuned with lr=2e-4.")
 
@@ -2344,8 +2510,8 @@ def run_training(
 
     # Define OCTMNIST asymmetric clinical cost matrix for Bayes risk minimization
     oct_cost_matrix = None
-    if dataset_name == "octmnist" and n_classes == 4 and use_cost_matrix:
-        # C[i, j] = cost of predicting j when true is i
+    if dataset_name == "octmnist" and n_classes == 4:
+        # C[action, true_class]; transpose the established true-by-action costs.
         # Classes: 0: CNV, 1: DME, 2: DRUSEN, 3: NORMAL
         # C(Drusen->CNV) = 1.5 avoids total suppression of CNV predictions
         oct_cost_matrix = torch.tensor([
@@ -2353,7 +2519,12 @@ def run_training(
             [1.0, 0.0, 1.0, 2.0],   # True DME
             [1.5, 1.5, 0.0, 2.0],   # True Drusen
             [2.0, 1.5, 1.0, 0.0],   # True Normal: false alarm penalty
-        ], device=device)
+        ], device=device).T.contiguous()
+    decision_policy = {
+        "type": "cost_matrix" if oct_cost_matrix is not None else "argmax",
+        "cost_matrix": oct_cost_matrix.detach().cpu().tolist() if oct_cost_matrix is not None else None,
+        "cost_matrix_orientation": "action_by_true_class",
+    }
 
     hybrid_test  = evaluate(hybrid,   test_loader, criterion, device, n_classes, max_samples=1000, cost_matrix=oct_cost_matrix)
     baseline_test = evaluate(baseline, test_loader, criterion, device, n_classes, max_samples=1000, cost_matrix=oct_cost_matrix)
@@ -2368,17 +2539,21 @@ def run_training(
     val_logits, val_labels_arr = _collect_val_logits(hybrid, val_loader, device)
     val_probs_temp = F.softmax(val_logits / max(T_opt, 1e-6), dim=1)
     val_labels_np = val_labels_arr.numpy()
+    cal_fit_idx, conformal_idx = split_calibration_indices(val_labels_np, seed=42)
+    fit_idx_tensor = torch.as_tensor(cal_fit_idx, dtype=torch.long)
+    fit_probs_temp = val_probs_temp[fit_idx_tensor]
+    fit_labels_tensor = val_labels_arr[fit_idx_tensor]
 
     # Calibration for bounded quantum outputs (Fix: Defect F-01 & Solution 1.5)
     if n_classes == 2:
         print("[calibration] Fitting Beta calibration on validation set...")
         beta_cal = QuantumBetaCalibrator()
-        beta_cal.fit(val_probs_temp.detach(), val_labels_arr)
+        beta_cal.fit(fit_probs_temp.detach(), fit_labels_tensor)
         with torch.no_grad():
             hybrid_test_probs_cal = beta_cal(hybrid_test_probs_temp).numpy()
             val_probs_cal = beta_cal(val_probs_temp).detach().numpy()
         tau_star, _ = optimize_decision_threshold(
-            val_probs_cal, val_labels_np,
+            val_probs_cal[cal_fit_idx], val_labels_np[cal_fit_idx],
             criterion=threshold_criterion,
             target_specificity=target_specificity,
             cost_fp=cost_fp,
@@ -2388,15 +2563,16 @@ def run_training(
     else:
         print(f"[calibration] Fitting Multi-Class Dirichlet calibration on validation set ({n_classes} classes)...")
         multi_cal = QuantumMultiClassCalibrator(n_classes=n_classes)
-        multi_cal.fit(val_probs_temp.detach(), val_labels_arr)
+        multi_cal.fit(fit_probs_temp.detach(), fit_labels_tensor)
         with torch.no_grad():
             hybrid_test_probs_cal = multi_cal(hybrid_test_probs_temp).numpy()
             val_probs_cal = multi_cal(val_probs_temp).detach().numpy()
         
         # Apply Cost-Sensitive Bayes Risk Minimization if cost matrix defined
         if oct_cost_matrix is not None:
-            risk_test = hybrid_test_probs_cal @ oct_cost_matrix.cpu().numpy()
-            hybrid_test_preds_cal = np.argmin(risk_test, axis=1)
+            hybrid_test_preds_cal = predict_with_cost_matrix(
+                hybrid_test_probs_cal, oct_cost_matrix.cpu().numpy()
+            )
             print("[calibration] Applied Cost-Sensitive Bayes Risk Minimization to calibrated multi-class probabilities.")
         else:
             hybrid_test_preds_cal = np.argmax(hybrid_test_probs_cal, axis=1)
@@ -2405,6 +2581,9 @@ def run_training(
     # P0-Fix: Unified calibrator reference for checkpoint serialization
     _cal_ckpt = beta_cal if n_classes == 2 else multi_cal
     _cal_type = "beta" if n_classes == 2 else "multiclass"
+    conformal_scores = build_mondrian_conformal_artifact(
+        val_probs_cal[conformal_idx], val_labels_np[conformal_idx], alpha=0.05
+    )
 
     hybrid_test_cal = dict(hybrid_test)
     hybrid_test_cal["probs"] = hybrid_test_probs_cal
@@ -2412,14 +2591,40 @@ def run_training(
     hybrid_test_cal["model"] = hybrid  # Fix E-03/E-04: Pass model for decision boundary & kernel gram
 
     # Baseline threshold calibration on validation set (Fix: prevent uncalibrated argmax collapse to all-Normal)
+    print("[calibration] Optimizing baseline temperature scaling on validation set...")
+    T_opt_b = optimize_temperature_scaling(baseline, val_loader, device)
     val_logits_b, _ = _collect_val_logits(baseline, val_loader, device)
-    val_probs_b = F.softmax(val_logits_b, dim=1).numpy()
+    val_probs_b_temp = F.softmax(val_logits_b / max(T_opt_b, 1e-6), dim=1)
+    fit_probs_b_temp = val_probs_b_temp[fit_idx_tensor]
     baseline_test_logits, _ = _collect_val_logits(baseline, test_loader, device)
-    baseline_test_probs = F.softmax(baseline_test_logits, dim=1).numpy()
+    baseline_test_probs_temp = F.softmax(baseline_test_logits / max(T_opt_b, 1e-6), dim=1)
+
+    if n_classes == 2:
+        print("[calibration] Fitting baseline Beta calibration on validation set...")
+        baseline_calibrator = QuantumBetaCalibrator()
+        baseline_calibrator.fit(fit_probs_b_temp.detach(), fit_labels_tensor)
+        with torch.no_grad():
+            val_probs_b = baseline_calibrator(val_probs_b_temp).numpy()
+            baseline_test_probs = baseline_calibrator(baseline_test_probs_temp).numpy()
+        baseline_conformal_scores = build_mondrian_conformal_artifact(
+            val_probs_b[conformal_idx], val_labels_np[conformal_idx], alpha=0.05
+        )
+        baseline_calibrator_type = "beta"
+    else:
+        print(f"[calibration] Fitting baseline Dirichlet calibration on validation set ({n_classes} classes)...")
+        baseline_calibrator = QuantumMultiClassCalibrator(n_classes=n_classes)
+        baseline_calibrator.fit(fit_probs_b_temp.detach(), fit_labels_tensor)
+        with torch.no_grad():
+            val_probs_b = baseline_calibrator(val_probs_b_temp).numpy()
+            baseline_test_probs = baseline_calibrator(baseline_test_probs_temp).numpy()
+        baseline_conformal_scores = build_mondrian_conformal_artifact(
+            val_probs_b[conformal_idx], val_labels_np[conformal_idx], alpha=0.05
+        )
+        baseline_calibrator_type = "multiclass"
 
     if n_classes == 2:
         tau_star_b, _ = optimize_decision_threshold(
-            val_probs_b, val_labels_np,
+            val_probs_b[cal_fit_idx], val_labels_np[cal_fit_idx],
             criterion=threshold_criterion,
             target_specificity=target_specificity,
             cost_fp=cost_fp,
@@ -2427,7 +2632,7 @@ def run_training(
         baseline_test_preds = (baseline_test_probs[:, 1] >= tau_star_b).astype(int)
         print(f"[calibration] Optimized Baseline decision threshold: τ*_b = {tau_star_b:.4f}")
     else:
-        baseline_test_preds = np.argmax(baseline_test_probs, axis=1)
+        baseline_test_preds = predict_with_cost_matrix(baseline_test_probs, oct_cost_matrix.cpu().numpy()) if oct_cost_matrix is not None else np.argmax(baseline_test_probs, axis=1)
         tau_star_b = 0.5
 
     baseline_test = dict(baseline_test)
@@ -2472,8 +2677,21 @@ def run_training(
     # app.py L184-193 expects ckpt["config"], ckpt["meta"], ckpt["model_state_dict"]
     # Previously: torch.save(hybrid.state_dict(), ...) caused KeyError: 'config' in app.py
     ckpt_dir = os.path.join(out_dir, "checkpoints")
+    def _checkpoint_safe(v):
+        if isinstance(v, (np.floating, float)):
+            return float(v)
+        if isinstance(v, (np.integer, int)):
+            return int(v)
+        if isinstance(v, np.ndarray):
+            return [_checkpoint_safe(x) for x in v.tolist()]
+        if isinstance(v, (list, tuple)):
+            return [_checkpoint_safe(x) for x in v]
+        if isinstance(v, dict):
+            return {str(k): _checkpoint_safe(x) for k, x in v.items()}
+        return v
     hybrid_ckpt = {
         "config": {
+            "schema_version": "3.0",
             "in_channels": in_channels,
             "n_classes": n_classes,
             "n_qubits": n_qubits,
@@ -2485,6 +2703,20 @@ def run_training(
             "image_size": image_size,
             "use_qnas": use_qnas,
             "qnas_genome": best_genome.to_dict() if best_genome is not None else None,
+            "reupload": True,
+            "p_drop": 0.10,
+            "q_init_std": q_init_std,
+            "dual_basis_only": dual_basis_readout,
+            "dual_basis_readout": dual_basis_readout,
+            "use_qaf_attention": use_qaf_attention,
+            "clinical_hard": clinical_hard,
+            "preprocess_mode": "biomedclip_normalized",
+            "class_order": list(range(n_classes)),
+            "decision_policy": decision_policy,
+            "finetune_backbone": enable_vit_finetuning,
+            "finetune_dataset": dataset_name if enable_vit_finetuning else None,
+            "finetune_unfreeze_layers": vit_unfreeze_layers if enable_vit_finetuning else 0,
+            "finetune_dir": biomedclip_dir if enable_vit_finetuning else None,
         },
         "meta": {
             "dataset_name": dataset_name,
@@ -2503,10 +2735,12 @@ def run_training(
         "model_state_dict": hybrid.state_dict(),
         "calibrator_state_dict": _cal_ckpt.state_dict(),
         "calibrator_type": _cal_type,
-        "metrics": dict(h_metrics),
+        "conformal_scores": conformal_scores,
+        "metrics": _checkpoint_safe(dict(h_metrics)),
     }
     baseline_ckpt = {
         "config": {
+            "schema_version": "3.0",
             "in_channels": in_channels,
             "n_classes": n_classes,
             "n_qubits": n_qubits,
@@ -2514,6 +2748,19 @@ def run_training(
             "dropout": dropout,
             "use_lora": use_lora,
             "image_size": image_size,
+            "dual_basis_only": dual_basis_readout,
+            "dual_basis_readout": dual_basis_readout,
+            "use_qaf_attention": use_qaf_attention,
+            "clinical_hard": clinical_hard,
+            "use_qnas": use_qnas,
+            "qnas_genome": best_genome.to_dict() if best_genome is not None else None,
+            "preprocess_mode": "biomedclip_normalized",
+            "class_order": list(range(n_classes)),
+            "decision_policy": decision_policy,
+            "finetune_backbone": enable_vit_finetuning,
+            "finetune_dataset": dataset_name if enable_vit_finetuning else None,
+            "finetune_unfreeze_layers": vit_unfreeze_layers if enable_vit_finetuning else 0,
+            "finetune_dir": biomedclip_dir if enable_vit_finetuning else None,
         },
         "meta": {
             "dataset_name": dataset_name,
@@ -2523,10 +2770,14 @@ def run_training(
             "best_val_loss": float(best_b_loss),
             "selection_criterion": "highest_val_auc_tiebreak_loss",
             "threshold": float(tau_star_b) if tau_star_b is not None else 0.5,
+            "temperature": float(T_opt_b),
             "is_best": True,
         },
         "model_state_dict": baseline.state_dict(),
-        "metrics": dict(b_metrics),
+        "calibrator_state_dict": baseline_calibrator.state_dict(),
+        "calibrator_type": baseline_calibrator_type,
+        "conformal_scores": baseline_conformal_scores,
+        "metrics": _checkpoint_safe(dict(b_metrics)),
     }
     torch.save(hybrid_ckpt, os.path.join(ckpt_dir, "hybrid_model.pt"))
     torch.save(baseline_ckpt, os.path.join(ckpt_dir, "baseline_model.pt"))
@@ -2578,6 +2829,21 @@ def run_training(
 
     summary_path = os.path.join(out_dir, "summary.json")
     summary_data = {
+        "schema_version": "3.0",
+        "config": hybrid_ckpt["config"],
+        "meta": hybrid_ckpt["meta"],
+        "hybrid_metrics": {k: _clean_json_val(v) for k, v in h_metrics.items()},
+        "baseline_metrics": {k: _clean_json_val(v) for k, v in b_metrics.items()},
+        "calibration": {
+            "temperature": float(T_opt),
+            "threshold": _clean_json_val(tau_star),
+            "calibrator_type": _cal_type,
+        },
+        "baseline_calibration": {
+            "temperature": float(T_opt_b),
+            "threshold": _clean_json_val(tau_star_b),
+            "calibrator_type": baseline_calibrator_type,
+        },
         "hybrid": {k: _clean_json_val(v) for k, v in h_metrics.items()},
         "baseline": {k: _clean_json_val(v) for k, v in b_metrics.items()},
         "best_epoch_hybrid": int(best_h_epoch),
@@ -2651,15 +2917,8 @@ def run_training(
             print(f"[plots] Saved Progressive Learning Trajectory to {prog_plot_path}")
         except Exception as e:
             print(f"[warn] Failed to generate progressive learning trajectory plot: {e}")
-    try:
-        n_cls = meta.get("n_classes", n_classes) if isinstance(meta, dict) else n_classes
-        cm = optimize_multiclass_cost_sensitive_thresholds(
-            hybrid_test_cal["probs"], hybrid_test_cal["labels"], n_classes=n_cls
-        )
-        preds_risk = predict_with_cost_matrix(hybrid_test_cal["probs"], cm)
-        np.save(os.path.join(out_dir, "cost_sensitive_preds.npy"), preds_risk)
-    except Exception as e:
-        print(f"[warn] Cost-sensitive thresholds skipped: {e}")
+    if oct_cost_matrix is not None:
+        np.save(os.path.join(out_dir, "cost_sensitive_preds.npy"), hybrid_test_preds_cal)
 
     if benchmark_mode:
         print(f"\n{'='*70}")
@@ -2722,6 +2981,21 @@ def run_continual_learning(
     max_classes = max(all_n_classes)
     in_channels = DATASET_CONFIG[dataset_sequence[0]]["in_channels"]
 
+    # A shared classifier can only support continual learning when class index
+    # semantics are identical across tasks.  PneumoniaMNIST and BreastMNIST
+    # are both binary, but class 1 means different diseases; comparing their
+    # retention accuracies through one head is clinically meaningless.
+    class_orders = [
+        tuple(DATASET_CONFIG[d].get("label_map", {}).get(i, str(i)) for i in range(DATASET_CONFIG[d]["n_classes"]))
+        for d in dataset_sequence
+    ]
+    if any(order != class_orders[0] for order in class_orders[1:]):
+        raise ValueError(
+            "Continual learning requires identical class-order semantics across tasks. "
+            f"Received: {dict(zip(dataset_sequence, class_orders))}. "
+            "Use task-specific heads for unrelated disease taxonomies."
+        )
+
     hybrid = HybridCNNVQC(
         in_channels, max_classes, n_qubits, n_layers,
         diff_method=diff_method, use_lora=use_lora, qdevice=qdevice
@@ -2744,12 +3018,24 @@ def run_continual_learning(
         n_classes = meta["n_classes"]
         test_loaders[dataset_name] = (test_loader, meta)
 
+        # Continual tasks may be resumed after a memory-saving offload.  Raw
+        # image extraction always requires the encoder; cached feature
+        # training below does not.  Make the lifecycle explicit rather than
+        # allowing a later task to fail inside extract_features().
+        if getattr(hybrid.backbone, "vision_encoder", None) is None:
+            hybrid.load_vision_encoder()
+
         cache_dir = os.path.join(output_dir, f"cache_{image_size}", dataset_name)
         os.makedirs(cache_dir, exist_ok=True)
         print(f"[cache] Extracting continual features for {dataset_name} ({cache_dir})...")
-        train_loader = extract_and_cache_features(hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"))
-        test_loader = extract_and_cache_features(hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"))
-        hybrid.offload_vision_encoder()
+        train_loader = extract_and_cache_features(
+            hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"),
+            cache_metadata={"dataset_name": dataset_name, "image_size": int(image_size), "split": "train", "continual_task": task_idx},
+        )
+        test_loader = extract_and_cache_features(
+            hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"),
+            cache_metadata={"dataset_name": dataset_name, "image_size": int(image_size), "split": "test", "continual_task": task_idx},
+        )
         import gc
         gc.collect()
         if torch.cuda.is_available():
@@ -2821,8 +3107,11 @@ def run_continual_learning(
         for eval_idx, eval_name in enumerate(dataset_sequence[:task_idx + 1]):
             eval_loader, eval_meta = test_loaders[eval_name]
             # Use cached version for eval as well
-            cache_dir = os.path.join(output_dir, "cache", eval_name)
-            eval_loader = extract_and_cache_features(hybrid, eval_loader, device, os.path.join(cache_dir, "test.pt"))
+            cache_dir = os.path.join(output_dir, f"cache_{image_size}", eval_name)
+            eval_loader = extract_and_cache_features(
+                hybrid, eval_loader, device, os.path.join(cache_dir, "test.pt"),
+                cache_metadata={"dataset_name": eval_name, "image_size": int(image_size), "split": "test", "continual_task": eval_idx},
+            )
             eval_n_classes = eval_meta["n_classes"]
             eval_criterion = FocalLoss(gamma=2.0)
             res = evaluate(hybrid, eval_loader, eval_criterion, device, eval_n_classes, max_samples=1000)
@@ -2834,6 +3123,8 @@ def run_continual_learning(
         plot_qewc_retention(retention_matrix, dataset_sequence, output_dir)
     except Exception as e:
         print(f"[warn] plot_qewc_retention skipped: {e}")
+
+    hybrid.offload_vision_encoder()
 
     print(f"\n[done] Continual learning completed across {len(dataset_sequence)} tasks.")
     print(f"  Retention matrix saved to: {output_dir}/")
@@ -2869,8 +3160,8 @@ def run_eval_only(
     print(f"  EVAL-ONLY & DIAGNOSTIC PLOT GENERATION ({out_dir}/)")
     print(f"{'='*70}")
 
-    hybrid_ckpt = torch.load(h_path, map_location=device, weights_only=False)
-    baseline_ckpt = torch.load(b_path, map_location=device, weights_only=False)
+    hybrid_ckpt = torch.load(h_path, map_location=device, weights_only=True)
+    baseline_ckpt = torch.load(b_path, map_location=device, weights_only=True)
 
     h_cfg = hybrid_ckpt.get("config", {})
     b_cfg = baseline_ckpt.get("config", {})
@@ -2882,6 +3173,12 @@ def run_eval_only(
     use_lora = h_cfg.get("use_lora", False)
     diff_method = h_cfg.get("diff_method", "backprop")
     chosen_qdevice = qdevice if qdevice != "auto" else h_cfg.get("qdevice", "auto")
+    dual_basis_only = h_cfg.get("dual_basis_only", h_cfg.get("dual_basis_readout", False))
+    use_qaf_attention = h_cfg.get("use_qaf_attention", False)
+    clinical_hard = h_cfg.get("clinical_hard", False)
+    preprocess_mode = h_cfg.get("preprocess_mode", "biomedclip_normalized")
+    p_drop = h_cfg.get("p_drop", 0.10)
+    q_init_std = h_cfg.get("q_init_std", 0.01)
 
     qw = hybrid_ckpt.get("model_state_dict", {}).get("qlayer.weights", None)
     if qw is not None and qw.ndim == 3:
@@ -2916,7 +3213,12 @@ def run_eval_only(
 
     init_depth = len(genome.layers) if genome is not None and hasattr(genome, "layers") else n_layers
     hybrid = HybridCNNVQC(in_channels, n_classes, n_qubits, init_depth, dropout=dropout,
-                          diff_method=diff_method, use_lora=use_lora, genome=genome,
+                          diff_method=diff_method, p_drop=p_drop,
+                          use_lora=use_lora, genome=genome, q_init_std=q_init_std,
+                          dual_basis_only=dual_basis_only,
+                          use_qaf_attention=use_qaf_attention,
+                          clinical_hard=clinical_hard,
+                          preprocess_mode=preprocess_mode,
                           qdevice=chosen_qdevice).to(device)
 
     # Grow layers if checkpoint weights indicate progressive expansion (e.g. L=2 -> 4 -> 6)
@@ -2931,11 +3233,24 @@ def run_eval_only(
     b_mlp_in = b_weights["mlp.0.weight"].shape[1] if "mlp.0.weight" in b_weights else None
     baseline = ClassicalBaseline(
         in_channels, n_classes, n_qubits, n_layers=n_layers, dropout=dropout, use_lora=use_lora,
-        mlp_hidden_dim=b_mlp_h, mlp_in_dim=b_mlp_in
+        mlp_hidden_dim=b_mlp_h, mlp_in_dim=b_mlp_in,
+        dual_basis_only=b_cfg.get("dual_basis_only", dual_basis_only),
+        clinical_hard=b_cfg.get("clinical_hard", clinical_hard),
+        genome=genome,
+        use_qaf_attention=b_cfg.get("use_qaf_attention", use_qaf_attention),
+        preprocess_mode=b_cfg.get("preprocess_mode", preprocess_mode),
     ).to(device)
 
-    hybrid.load_state_dict(hybrid_ckpt["model_state_dict"], strict=False)
-    baseline.load_state_dict(baseline_ckpt["model_state_dict"], strict=False)
+    h_missing, h_unexpected = hybrid.load_state_dict(hybrid_ckpt["model_state_dict"], strict=False)
+    b_missing, b_unexpected = baseline.load_state_dict(baseline_ckpt["model_state_dict"], strict=False)
+    h_critical = [k for k in h_missing if not k.startswith("backbone.vision_encoder.")]
+    b_critical = [k for k in b_missing if not k.startswith("backbone.vision_encoder.")]
+    if h_critical or b_critical or h_unexpected or b_unexpected:
+        raise RuntimeError(
+            "Eval-only checkpoint architecture mismatch: "
+            f"hybrid_missing={h_critical[:5]}, hybrid_unexpected={h_unexpected[:5]}, "
+            f"baseline_missing={b_critical[:5]}, baseline_unexpected={b_unexpected[:5]}"
+        )
     hybrid.to(device)
     baseline.to(device)
 
@@ -2954,9 +3269,23 @@ def run_eval_only(
     cache_dir = os.path.join(out_dir, f"cache_{image_size}")
     if not os.path.exists(cache_dir):
         cache_dir = os.path.join(out_dir, "cache")
-    train_loader = extract_and_cache_features(hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"))
-    val_loader = extract_and_cache_features(hybrid, val_loader, device, os.path.join(cache_dir, "val.pt"))
-    test_loader = extract_and_cache_features(hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"))
+    eval_cache_common = {
+        "dataset_name": dataset_name,
+        "image_size": int(image_size),
+        "split_source": "eval_only",
+    }
+    train_loader = extract_and_cache_features(
+        hybrid, train_loader, device, os.path.join(cache_dir, "train.pt"),
+        cache_metadata={**eval_cache_common, "split": "train"},
+    )
+    val_loader = extract_and_cache_features(
+        hybrid, val_loader, device, os.path.join(cache_dir, "val.pt"),
+        cache_metadata={**eval_cache_common, "split": "val"},
+    )
+    test_loader = extract_and_cache_features(
+        hybrid, test_loader, device, os.path.join(cache_dir, "test.pt"),
+        cache_metadata={**eval_cache_common, "split": "test"},
+    )
     hybrid.offload_vision_encoder()
     baseline.offload_vision_encoder()
     import gc
@@ -2973,14 +3302,24 @@ def run_eval_only(
     T_opt = float(h_meta.get("temperature", 1.0))
     tau_star = float(h_meta.get("threshold", 0.5))
 
-    raw_probs = torch.tensor(hybrid_test["probs"]).float()
-    ln_p = torch.log(torch.clamp(raw_probs, 1e-12, 1.0))
-    probs_temp = F.softmax(ln_p / max(T_opt, 1e-6), dim=1).numpy()
+    h_logits_test = hybrid_test["logits"].float()
+    probs_temp_t = F.softmax(h_logits_test / max(T_opt, 1e-6), dim=1)
+    h_calibration = hybrid_ckpt.get("calibration") or {}
+    h_cal_state = hybrid_ckpt.get("calibrator_state_dict")
+    if h_cal_state:
+        h_calibrator = QuantumBetaCalibrator() if hybrid_ckpt.get("calibrator_type", h_calibration.get("calibrator_type")) == "beta" else QuantumMultiClassCalibrator(n_classes=n_classes)
+        h_calibrator.load_state_dict(h_cal_state, strict=True)
+        with torch.no_grad():
+            probs_temp_t = h_calibrator(probs_temp_t)
+    probs_temp = probs_temp_t.numpy()
 
     if n_classes == 2 and (recalibrate_threshold or threshold_criterion != "youden" or target_specificity != 0.90):
         print(f"\n[eval_only] Optimizing decision threshold on validation set (Criterion: '{threshold_criterion}')...")
         val_logits, val_labels_arr = _collect_val_logits(hybrid, val_loader, device)
         val_probs_temp = F.softmax(val_logits / max(T_opt, 1e-6), dim=1)
+        if h_cal_state:
+            with torch.no_grad():
+                val_probs_temp = h_calibrator(val_probs_temp)
         val_labels_np = val_labels_arr.numpy()
         tau_star, _ = optimize_decision_threshold(
             val_probs_temp.numpy(), val_labels_np,
@@ -2994,6 +3333,9 @@ def run_eval_only(
         preds_cal = (p_pos >= tau_star).astype(int)
     else:
         preds_cal = np.argmax(probs_temp, axis=1)
+        policy = h_cfg.get("decision_policy", {})
+        if policy.get("type") == "cost_matrix":
+            preds_cal = predict_with_cost_matrix(probs_temp, policy["cost_matrix"])
 
     hybrid_test_cal = dict(hybrid_test)
     hybrid_test_cal["probs"] = probs_temp
@@ -3004,9 +3346,18 @@ def run_eval_only(
 
     # Calibrate / threshold baseline for fair comparison
     val_logits_b, val_labels_arr_b = _collect_val_logits(baseline, val_loader, device)
-    val_probs_b = F.softmax(val_logits_b, dim=1).numpy()
     b_meta = baseline_ckpt.get("meta", {})
     tau_star_b = float(b_meta.get("threshold", 0.5))
+    T_opt_b = float(b_meta.get("temperature", 1.0))
+    val_probs_b_t = F.softmax(val_logits_b / max(T_opt_b, 1e-6), dim=1)
+    b_calibration = baseline_ckpt.get("calibration") or {}
+    b_cal_state = baseline_ckpt.get("calibrator_state_dict")
+    if b_cal_state:
+        b_calibrator = QuantumBetaCalibrator() if baseline_ckpt.get("calibrator_type", b_calibration.get("calibrator_type")) == "beta" else QuantumMultiClassCalibrator(n_classes=n_classes)
+        b_calibrator.load_state_dict(b_cal_state, strict=True)
+        with torch.no_grad():
+            val_probs_b_t = b_calibrator(val_probs_b_t)
+    val_probs_b = val_probs_b_t.numpy()
 
     if n_classes == 2 and (recalibrate_threshold or threshold_criterion != "youden" or target_specificity != 0.90 or "threshold" not in b_meta):
         tau_star_b, _ = optimize_decision_threshold(
@@ -3018,11 +3369,19 @@ def run_eval_only(
         print(f"[eval_only] Optimized Baseline decision threshold on validation set: τ*_b = {tau_star_b:.4f}")
 
     raw_probs_b = torch.tensor(baseline_test["probs"]).float()
-    probs_temp_b = F.softmax(raw_probs_b, dim=1).numpy()
+    b_logits_test = baseline_test["logits"].float()
+    probs_temp_b_t = F.softmax(b_logits_test / max(T_opt_b, 1e-6), dim=1)
+    if b_cal_state:
+        with torch.no_grad():
+            probs_temp_b_t = b_calibrator(probs_temp_b_t)
+    probs_temp_b = probs_temp_b_t.numpy()
     if n_classes == 2:
         preds_cal_b = (probs_temp_b[:, 1] >= tau_star_b).astype(int)
     else:
         preds_cal_b = np.argmax(probs_temp_b, axis=1)
+        policy_b = b_cfg.get("decision_policy", {})
+        if policy_b.get("type") == "cost_matrix":
+            preds_cal_b = predict_with_cost_matrix(probs_temp_b, policy_b["cost_matrix"])
 
     baseline_test = dict(baseline_test)
     baseline_test["probs"] = probs_temp_b
@@ -3079,15 +3438,9 @@ def run_eval_only(
         )
     else:
         print(f"\n[eval_only] Skipping diagnostic plots (--skip_plots enabled). Metrics saved in {out_dir}/summary.json")
-    try:
-        n_cls = meta.get("n_classes", n_classes) if isinstance(meta, dict) else n_classes
-        cm = optimize_multiclass_cost_sensitive_thresholds(
-            hybrid_test_cal["probs"], hybrid_test_cal["labels"], n_classes=n_cls
-        )
-        preds_risk = predict_with_cost_matrix(hybrid_test_cal["probs"], cm)
-        np.save(os.path.join(out_dir, "cost_sensitive_preds.npy"), preds_risk)
-    except Exception as e:
-        print(f"[warn] Cost-sensitive thresholds skipped: {e}")
+    policy = h_cfg.get("decision_policy", {})
+    if policy.get("type") == "cost_matrix":
+        np.save(os.path.join(out_dir, "cost_sensitive_preds.npy"), hybrid_test_cal["preds"])
 
     h_metrics = compute_clinical_metrics(
         hybrid_test_cal["labels"], hybrid_test_cal["preds"], hybrid_test_cal["probs"], n_classes

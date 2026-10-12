@@ -386,6 +386,8 @@ class CircuitGenome:
     max_depth: Optional[int] = None
     qfim_condition: Optional[float] = None  # Phase 6.1: Metric tensor condition number
     hardware_cost: Optional[int] = None     # Phase 6.2: Routing-aware CNOT coupling cost
+    valid: bool = True
+    invalid_reason: Optional[str] = None
 
     def compute_stats(self) -> None:
         cnot = 0
@@ -412,6 +414,8 @@ class CircuitGenome:
             "cnot_count": int(self.cnot_count),
             "mw_entanglement": float(self.mw_entanglement),
             "max_depth": self.max_depth,
+            "valid": bool(self.valid),
+            "invalid_reason": self.invalid_reason,
         }
         # Fix F-07: Serialize trained weights for warm-start transfer
         if self.trained_weights is not None:
@@ -433,6 +437,8 @@ class CircuitGenome:
             max_depth=d.get("max_depth", None),
             qfim_condition=d.get("qfim_condition"),
             hardware_cost=d.get("hardware_cost"),
+            valid=d.get("valid", True),
+            invalid_reason=d.get("invalid_reason"),
         )
         genome.layers = [
             [GateGene.from_dict(g) for g in layer]
@@ -645,6 +651,8 @@ class QNASOptimizer:
         # Fix F-13: Track fitness history for diagnostic plots
         self._fitness_history: List[List[float]] = []
         self._best_history: List[float] = []
+        self.invalid_evaluations: int = 0
+        self.evaluation_errors: List[str] = []
         # Cache singleton PennyLane simulation device to avoid repeated reallocations
         self._cached_dev, self._cached_dev_name = self._get_device()
 
@@ -891,12 +899,20 @@ class QNASOptimizer:
         genome.hardware_cost = cnot_cost
 
         if cnot_cost > self.max_cnot:
-            genome.fitness = -999.0
+            genome.valid = False
+            genome.invalid_reason = f"hardware_cost {cnot_cost} exceeds max_cnot {self.max_cnot}"
+            genome.val_auc = float("nan")
+            genome.fitness = -float("inf")
+            self.invalid_evaluations += 1
             return genome.fitness
 
         total_p = genome.total_params
         if total_p == 0:
-            genome.fitness = -999.0
+            genome.valid = False
+            genome.invalid_reason = "candidate contains no trainable parameters"
+            genome.val_auc = float("nan")
+            genome.fitness = -float("inf")
+            self.invalid_evaluations += 1
             return genome.fitness
 
         qnode, _ = self.build_qnode(genome)
@@ -1236,9 +1252,24 @@ class QNASOptimizer:
         population = self.initialize_population()
 
         for g in population:
-            self.evaluate_individual_proxy(g, train_z, train_y, val_z, val_y, n_classes, class_weights=class_weights)
+            try:
+                self.evaluate_individual_proxy(g, train_z, train_y, val_z, val_y, n_classes, class_weights=class_weights)
+            except Exception as exc:
+                g.valid = False
+                g.invalid_reason = f"evaluation error: {type(exc).__name__}: {exc}"
+                g.val_auc = float("nan")
+                g.fitness = -float("inf")
+                self.invalid_evaluations += 1
+                self.evaluation_errors.append(g.invalid_reason)
 
-        best_genome = max(population, key=lambda ind: ind.fitness)
+        valid_population = [ind for ind in population if ind.valid and np.isfinite(ind.fitness)]
+        if not valid_population:
+            raise RuntimeError(
+                "QNAS produced no valid candidate architectures. "
+                f"invalid_evaluations={self.invalid_evaluations}; "
+                f"errors={self.evaluation_errors[:3]}"
+            )
+        best_genome = max(valid_population, key=lambda ind: ind.fitness)
 
         # Fix F-13: Track fitness history
         self._fitness_history.append([ind.fitness for ind in population])
@@ -1258,7 +1289,15 @@ class QNASOptimizer:
                     p2 = select_parent_tournament(population, k=3)
                 child = self.crossover(p1, p2)
                 child = self.mutate(child)
-                self.evaluate_individual_proxy(child, train_z, train_y, val_z, val_y, n_classes, class_weights=class_weights)
+                try:
+                    self.evaluate_individual_proxy(child, train_z, train_y, val_z, val_y, n_classes, class_weights=class_weights)
+                except Exception as exc:
+                    child.valid = False
+                    child.invalid_reason = f"evaluation error: {type(exc).__name__}: {exc}"
+                    child.val_auc = float("nan")
+                    child.fitness = -float("inf")
+                    self.invalid_evaluations += 1
+                    self.evaluation_errors.append(child.invalid_reason)
                 next_pop.append(child)
 
             population = next_pop
@@ -1276,6 +1315,15 @@ class QNASOptimizer:
         # Fix F-13: Save diagnostic plots if output_dir is provided
         if self.output_dir:
             self._plot_diagnostics(population)
+
+        if self.output_dir:
+            with open(os.path.join(self.output_dir, "qnas_evaluation_status.json"), "w", encoding="utf-8") as handle:
+                import json
+                json.dump({
+                    "invalid_evaluations": self.invalid_evaluations,
+                    "evaluation_errors": self.evaluation_errors[:100],
+                    "valid_final_candidates": int(sum(ind.valid for ind in population)),
+                }, handle, indent=2)
 
         return best_genome
 
@@ -1300,7 +1348,11 @@ class QNASOptimizer:
             ax.plot(range(len(self._best_history)), self._best_history,
                     "o-", color="#2196F3", linewidth=2, markersize=6, label="Best Fitness")
             if self._fitness_history:
-                gen_means = [np.mean(gen_fits) for gen_fits in self._fitness_history]
+                gen_means = [
+                    np.mean([value for value in gen_fits if np.isfinite(value)])
+                    if any(np.isfinite(value) for value in gen_fits) else np.nan
+                    for gen_fits in self._fitness_history
+                ]
                 ax.plot(range(len(gen_means)), gen_means,
                         "s--", color="#FF9800", linewidth=1.5, markersize=4, label="Population Mean")
             ax.set_xlabel("Generation", fontsize=12)
@@ -1316,9 +1368,12 @@ class QNASOptimizer:
         if final_population:
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 
-            aucs = [g.val_auc for g in final_population]
-            cnots = [g.cnot_count for g in final_population]
-            mws = [g.mw_entanglement for g in final_population]
+            valid_population = [g for g in final_population if g.valid and np.isfinite(g.val_auc)]
+            if not valid_population:
+                return
+            aucs = [g.val_auc for g in valid_population]
+            cnots = [g.cnot_count for g in valid_population]
+            mws = [g.mw_entanglement for g in valid_population]
 
             ax = axes[0]
             sc = ax.scatter(cnots, aucs, c=mws, cmap="coolwarm", s=80, edgecolors="k", linewidths=0.5)
@@ -1450,4 +1505,3 @@ if __name__ == "__main__":
         print("[QNAS] Weight serialization round-trip: OK")
 
     print("[OK]  qnas.py self-test passed successfully.")
-
